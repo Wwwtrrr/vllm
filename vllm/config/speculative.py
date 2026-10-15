@@ -68,6 +68,7 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+MMuseModelTypes = Literal["mmuse"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -81,6 +82,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
+    MMuseModelTypes,
 ]
 RejectionSampleMethod = Literal["standard", "synthetic", "block"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
@@ -629,6 +631,7 @@ class SpeculativeConfig:
             "extract_hidden_states",
             "dflash",
             "dspark",
+            "mmuse",
         )
         factors.append(uses_aux_hidden_states)
         if self.method == "dspark":
@@ -1138,6 +1141,9 @@ class SpeculativeConfig:
             )
             self.method = "mtp"
 
+        if self.use_mmuse() and self.model is None:
+            raise ValueError("method='mmuse' requires an explicit draft model.")
+
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
                 if self.target_model_config is None:
@@ -1318,8 +1324,19 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark", "mmuse"):
                     pass
+                elif (
+                    getattr(
+                        self.draft_model_config.hf_config,
+                        "speculators_model_type",
+                        None,
+                    )
+                    == "mmuse"
+                    or "MMuseSpeculator" in self.draft_model_config.architectures
+                    or "MMuseDraftModel" in self.draft_model_config.architectures
+                ):
+                    self.method = "mmuse"
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
                 # yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
@@ -1459,7 +1476,7 @@ class SpeculativeConfig:
                     ):
                         hf.dspark_target_layer_ids = hf.target_layer_ids
 
-                if self.method in ("dflash", "dspark"):
+                if self.method in ("dflash", "dspark", "mmuse"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1939,7 +1956,7 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark", "mmuse")
 
     def use_eagle_block_drop(self) -> bool:
         """Whether volatile trailing cache blocks should be discarded."""
@@ -1950,6 +1967,9 @@ class SpeculativeConfig:
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def use_mmuse(self) -> bool:
+        return self.method == "mmuse"
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

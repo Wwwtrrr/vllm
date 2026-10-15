@@ -649,6 +649,8 @@ _SPECULATIVE_DECODING_MODELS = {
         "DSparkDeepseekV4ForCausalLM",
     ),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
+    "MMuseSpeculator": ("qwen3_mmuse", "MMuseQwen3ForCausalLM"),
+    "MMuseDraftModel": ("qwen3_mmuse", "MMuseQwen3ForCausalLM"),
     "Qwen3OmniDSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "K3DSparkModel": (
         "vllm.models.kimi_k3.nvidia.dspark_mla",

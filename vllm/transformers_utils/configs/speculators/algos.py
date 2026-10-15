@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 SUPPORTED_SPECULATORS_TYPES = {}
 
 
@@ -147,6 +149,31 @@ def update_dflash2(config_dict: dict, pre_trained_config: dict) -> None:
     ):
         if config_dict.get(key) is not None:
             pre_trained_config["dflash_config"][key] = config_dict[key]
+
+
+@register_speculator("mmuse")
+def update_mmuse(config_dict: dict, pre_trained_config: dict) -> None:
+    """Preserve MMuse's identity and options without selecting a baseline model.
+
+    Runtime model registration and speculative dispatch are separate from this
+    configuration conversion; MMuse must not fall back to DSpark or DFlash.
+    """
+    source_config = copy.deepcopy(config_dict)
+    metadata_fields = {
+        "architectures",
+        "model_type",
+        "speculators_config",
+        "transformer_layer_config",
+    }
+    for key, value in config_dict.items():
+        if key not in metadata_fields:
+            pre_trained_config[key] = value
+    pre_trained_config["speculators_model_type"] = "mmuse"
+    pre_trained_config["architectures"] = ["MMuseSpeculator"]
+    pre_trained_config["mmuse_source_config"] = source_config
+    aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+    pre_trained_config["target_layer_ids"] = [i - 1 for i in aux_layer_ids]
 
 
 @register_speculator("dspark")
