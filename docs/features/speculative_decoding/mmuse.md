@@ -11,13 +11,27 @@ do not establish end-to-end correctness or speedup.
 - Speculators-format `speculators_model_type="mmuse"` configuration.
 - `sample_from_anchor=True`, full-attention draft layers, enabled Correction.
 - Fixed proposal length equal to the trained block size (typically 7).
-- Greedy draft proposals, eager target and draft execution, one device.
+- Greedy or probabilistic draft proposals, eager execution, one device.
 - No quantization, watermarking or adaptive verification.
 
 These are implementation limits; commenting out a configuration check does not
 add support for that mode. Model Runner V1 rejects MMuse explicitly.
 The target's generation temperature is separate from the draft sampling mode;
 start evaluation with greedy target requests as well.
+
+For probabilistic proposals, set `draft_sample_method` to `"probabilistic"`
+in the speculative config and use a positive request temperature. MMuse calls
+the backend Gumbel sampler after each final Correction/Markov step, using the
+request-state mapping, request temperature, seed and predicted token position.
+Pre-temperature logits are cached in the framework's `draft_logits` buffer for
+rejection sampling. The sampled token is fed into subsequent online Correction
+steps. Static Selector conditioning remains static as specified by the checkpoint.
+As with the existing V2 drafter, draft sampling uses temperature, not request
+top-k/top-p; target sampling retains its own processing. Zero-temperature requests
+remain greedy, including within a mixed batch. Watermarking and adaptive
+verification are rejected for this new path. GPU/NPU end-to-end validation of
+probabilistic MMuse remains required; previous greedy serving results do not
+validate this extension.
 
 ## Implementation
 

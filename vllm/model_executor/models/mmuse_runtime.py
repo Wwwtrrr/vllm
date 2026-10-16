@@ -35,8 +35,25 @@ def validate_mmuse_config(config) -> None:
             raise ValueError(f"MMuse reference adapter requires {name}=1")
     # if not config.model_config.enforce_eager or not spec.enforce_eager:
     #     raise ValueError("MMuse requires target and draft enforce_eager=True")
-    # if spec.draft_sample_method != "greedy":
-    #     raise ValueError("MMuse reference adapter only supports greedy drafting")
+    if spec.draft_sample_method == "probabilistic":
+        if not config.model_config.enforce_eager or not spec.enforce_eager:
+            raise ValueError("MMuse probabilistic drafting requires enforce_eager=True")
+        if getattr(config, "watermark_config", None) is not None:
+            raise ValueError(
+                "MMuse probabilistic drafting does not support watermarking"
+            )
+        if spec.enable_adaptive_verification:
+            raise ValueError(
+                "MMuse probabilistic adaptive verification is not supported"
+            )
+        if not source.get("sample_from_anchor", True):
+            raise ValueError(
+                "MMuse probabilistic drafting requires sample_from_anchor=True"
+            )
+        if spec.num_speculative_tokens != source["block_size"]:
+            raise ValueError(
+                "MMuse num_speculative_tokens must equal trained block_size"
+            )
     # if spec.enable_adaptive_verification:
     #     raise ValueError("MMuse adaptive verification is not implemented")
     # if getattr(config, "watermark_config", None) is not None:
@@ -53,7 +70,7 @@ def validate_mmuse_config(config) -> None:
     #     raise ValueError("MMuse reference adapter requires auxiliary hidden states")
     # vocab_size = config.model_config.get_vocab_size()
     # if (source.get("draft_vocab_size") or hf.vocab_size) != vocab_size:
-    #     raise ValueError("MMuse reference adapter requires the full target vocabulary")
+    #     raise ValueError("MMuse requires the full target vocabulary")
     # if hf.hidden_size != config.model_config.get_hidden_size():
     #     raise ValueError("MMuse target and draft hidden sizes must match")
     if any(
@@ -68,7 +85,33 @@ def validate_mmuse_config(config) -> None:
 
 
 class MMuseGreedyRolloutMixin:
-    """Shared GPU/NPU proposal stage; feedback stays inside the source rollout."""
+    """Shared GPU/NPU rollout with greedy or framework probabilistic sampling."""
+
+    def _mmuse_gumbel_sample(self, *args, **kwargs):
+        from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+
+        return gumbel_sample(*args, **kwargs)
+
+    def _sample_mmuse_token(self, logits, position, num_reqs):
+        if self.draft_logits is None:
+            raise RuntimeError("MMuse probabilistic drafting requires a logits cache")
+        # Sample the same precision that the verifier will read from the cache.
+        logits = logits.to(self.draft_logits.dtype).contiguous()
+        rows = slice(
+            position, num_reqs * self.num_query_per_req, self.num_query_per_req
+        )
+        return self._mmuse_gumbel_sample(
+            logits,
+            self.sample_idx_mapping[rows],
+            self.temperature,
+            self.seeds,
+            self.sample_pos[rows] - 1,
+            apply_temperature=True,
+            is_drafting=True,
+            logits_cache=self.draft_logits,
+            logits_cache_col=self.sample_col[rows],
+            use_fp64=self.use_fp64_gumbel,
+        )
 
     def prepare_context_anchor(self, input_batch, num_rejected) -> None:
         count = input_batch.num_reqs
@@ -110,5 +153,14 @@ class MMuseGreedyRolloutMixin:
         anchor_ids = self.input_buffers.input_ids[
             : num_reqs * self.num_query_per_req : self.num_query_per_req
         ]
-        tokens, _ = self.model.rollout_mmuse(block, anchor_ids)
+        if self.draft_logits is None:
+            tokens, _ = self.model.rollout_mmuse(block, anchor_ids)
+        else:
+            tokens, _ = self.model.rollout_mmuse(
+                block,
+                anchor_ids,
+                sample_token=lambda logits, position: self._sample_mmuse_token(
+                    logits, position, num_reqs
+                ),
+            )
         self.draft_tokens[:num_reqs].copy_(tokens)

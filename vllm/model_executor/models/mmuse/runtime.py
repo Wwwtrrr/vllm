@@ -3,6 +3,8 @@
 # See NOTICE and source_manifest.json for provenance and modifications.
 """Inference-only MMuse modules and causal rollout; no training dependency."""
 
+from collections.abc import Callable
+
 import torch
 from torch import nn
 
@@ -563,6 +565,7 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
         anchor_token_ids: torch.Tensor,
         *,
         temperature: float = 0.0,
+        sample_token: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
         initial_previous_logits: torch.Tensor | None = None,
         precomputed_base_logits: torch.Tensor | None = None,
         conditioning_current_ids: torch.Tensor | None = None,
@@ -707,7 +710,9 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                     final_logits = final_logits[:, 0]
 
             with torch.no_grad():
-                if temperature > 0:
+                if sample_token is not None:
+                    sampled_indices = sample_token(final_logits, position)
+                elif temperature > 0:
                     probabilities = torch.softmax(
                         final_logits.float() / temperature, dim=-1
                     )
@@ -753,6 +758,7 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
         anchor_token_ids: torch.Tensor,
         *,
         temperature: float = 0.0,
+        sample_token: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
         initial_previous_logits: torch.Tensor | None = None,
         base_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -790,6 +796,7 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
             dflash_hidden,
             anchor_token_ids,
             temperature=temperature,
+            sample_token=sample_token,
             initial_previous_logits=initial_previous_logits,
             precomputed_base_logits=base_logits,
             conditioning_current_ids=conditioning_current_ids,

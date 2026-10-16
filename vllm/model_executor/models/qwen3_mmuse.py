@@ -150,11 +150,13 @@ class MMuseQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         self._target_weights_bound = True
 
     @torch.inference_mode()
-    def rollout_mmuse(self, hidden, anchor_ids):
+    def rollout_mmuse(self, hidden, anchor_ids, *, sample_token=None):
         if not self._target_weights_bound:
             raise RuntimeError("MMuse target embedding/head have not been bound")
         # The local rollout preserves Selector, cache, feedback and Markov order.
-        return self.runtime.rollout_correction(hidden, anchor_ids, temperature=0.0)
+        return self.runtime.rollout_correction(
+            hidden, anchor_ids, temperature=0.0, sample_token=sample_token
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         mapped = []
