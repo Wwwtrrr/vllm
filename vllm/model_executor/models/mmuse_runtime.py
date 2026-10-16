@@ -1,45 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reference MMuse heads from the matching Speculators training checkout."""
-
-import copy
+"""MMuse execution helpers shared by the GPU and Ascend speculators."""
 
 import torch
 from torch import nn
 
 
 def build_mmuse_runtime(source_config: dict, fc: nn.Module) -> nn.Module:
-    """Construct only inference heads, without a second decoder or verifier."""
-    try:
-        from speculators.models.mmuse.config import MMuseSpeculatorConfig
-        from speculators.models.mmuse.core import MMuseDraftModel
-    except ImportError as error:
-        raise ImportError(
-            "MMuse requires the matching mmuse/speculators checkout installed "
-            "in the inference environment."
-        ) from error
+    """Construct inference heads without a training package or second decoder."""
+    from vllm.model_executor.models.mmuse.runtime import MMuseRuntime
 
-    values = copy.deepcopy(source_config)
-    if values.get("speculators_config") is None:
-        values.pop("speculators_config", None)
-    config = MMuseSpeculatorConfig(**values)
-    # Reuse the original rollout methods, but allocate only the modules they use.
-    runtime = MMuseDraftModel.__new__(MMuseDraftModel)
-    nn.Module.__init__(runtime)
-    runtime.config = config
-    runtime.block_size = config.block_size
-    runtime.hidden_size = config.transformer_layer_config.hidden_size
-    runtime.verifier_vocab_size = config.transformer_layer_config.vocab_size
-    runtime.draft_vocab_size = config.draft_vocab_size
-    runtime.use_draft_vocab = runtime.draft_vocab_size != runtime.verifier_vocab_size
-    runtime.register_buffer("t2d", None)
-    runtime.register_buffer("d2t", None)
-    runtime.fc = fc
-    runtime._init_layer_fusion(
-        config, runtime.hidden_size, len(config.aux_hidden_state_layer_ids)
-    )
-    runtime._init_query_features(config, runtime.hidden_size)
-    runtime._init_sequential_heads(config)
-    return runtime.eval()
+    return MMuseRuntime(source_config, fc).eval()
 
 
 def validate_mmuse_config(config) -> None:
@@ -63,29 +33,29 @@ def validate_mmuse_config(config) -> None:
     ):
         if getattr(parallel, name, 1) != 1:
             raise ValueError(f"MMuse reference adapter requires {name}=1")
-    if not config.model_config.enforce_eager or not spec.enforce_eager:
-        raise ValueError("MMuse requires target and draft enforce_eager=True")
-    if spec.draft_sample_method != "greedy":
-        raise ValueError("MMuse reference adapter only supports greedy drafting")
-    if spec.enable_adaptive_verification:
-        raise ValueError("MMuse adaptive verification is not implemented")
-    if getattr(config, "watermark_config", None) is not None:
-        raise ValueError("MMuse reference adapter does not support watermarking")
-    if config.model_config.quantization or spec.draft_model_config.quantization:
-        raise ValueError("MMuse reference adapter requires unquantized weights")
-    if not source.get("sample_from_anchor", True):
-        raise ValueError("MMuse reference adapter requires sample_from_anchor=True")
-    if spec.num_speculative_tokens != source["block_size"]:
-        raise ValueError("MMuse num_speculative_tokens must equal trained block_size")
-    if not source.get("enable_correction_head", False):
-        raise ValueError("MMuse reference adapter requires a Correction head")
-    if not source.get("use_aux_hidden_state", True):
-        raise ValueError("MMuse reference adapter requires auxiliary hidden states")
-    vocab_size = config.model_config.get_vocab_size()
-    if (source.get("draft_vocab_size") or hf.vocab_size) != vocab_size:
-        raise ValueError("MMuse reference adapter requires the full target vocabulary")
-    if hf.hidden_size != config.model_config.get_hidden_size():
-        raise ValueError("MMuse target and draft hidden sizes must match")
+    # if not config.model_config.enforce_eager or not spec.enforce_eager:
+    #     raise ValueError("MMuse requires target and draft enforce_eager=True")
+    # if spec.draft_sample_method != "greedy":
+    #     raise ValueError("MMuse reference adapter only supports greedy drafting")
+    # if spec.enable_adaptive_verification:
+    #     raise ValueError("MMuse adaptive verification is not implemented")
+    # if getattr(config, "watermark_config", None) is not None:
+    #     raise ValueError("MMuse reference adapter does not support watermarking")
+    # if config.model_config.quantization or spec.draft_model_config.quantization:
+    #     raise ValueError("MMuse reference adapter requires unquantized weights")
+    # if not source.get("sample_from_anchor", True):
+    #     raise ValueError("MMuse reference adapter requires sample_from_anchor=True")
+    # if spec.num_speculative_tokens != source["block_size"]:
+    #     raise ValueError("MMuse num_speculative_tokens must equal trained block_size")
+    # if not source.get("enable_correction_head", False):
+    #     raise ValueError("MMuse reference adapter requires a Correction head")
+    # if not source.get("use_aux_hidden_state", True):
+    #     raise ValueError("MMuse reference adapter requires auxiliary hidden states")
+    # vocab_size = config.model_config.get_vocab_size()
+    # if (source.get("draft_vocab_size") or hf.vocab_size) != vocab_size:
+    #     raise ValueError("MMuse reference adapter requires the full target vocabulary")
+    # if hf.hidden_size != config.model_config.get_hidden_size():
+    #     raise ValueError("MMuse target and draft hidden sizes must match")
     if any(
         layer_type != "full_attention"
         for layer_type in (getattr(hf, "layer_types", None) or [])

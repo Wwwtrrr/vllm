@@ -1,0 +1,18 @@
+{
+  "mmuse/dynamic_conv.py": "d311a0d3a3e2cdcede2d3b3a220d8ab3bf4e183971d6c5387be33c6cd83b8b30",
+  "mmuse/selector.py": "e8b76f5e3988088422c9a09da75597ff5cafb3a15a5d66bf7d20e786d9ffbb89",
+  "mmuse/correction.py": "e9f633480f16c4a564858847201adf9e7097cfb9e7fb8218c0cfa94042938e59",
+  "mmuse/correction_inputs.py": "224d6392a59a39d6c9b78100f72e6d841abc4aa77267f575e0f444c7469c0259",
+  "mmuse/rollout_state.py": "ed52417ce28052817a248d9cc5d2b10d9decfb084a6f5af51fda689bfdcf8669",
+  "mmuse/rollout_validation.py": "bdb0136db512e28d925b031fd8c439d03e72947ed89ed6cae8ed9b730ea31d76",
+  "mmuse/selector_inputs.py": "ac639fbde44cec3b3fd060f21b22a01c4187c07b3b9cef0f93d90d77ad1cb1ba",
+  "mmuse/runtime_types.py": "b97ac4e316a214b4fc6ca7767c29dc5ce724b16e10df9a51f2d1373c877092cf",
+  "mmuse/selector_runtime.py": "6d90862846a1fab52dc5857781c296396ef2d2c7608c554dc9ff5af12a8a3b0d",
+  "dspark/model_definitions.py": "eecae877217ea5aa84a3bba3a4ecf411c14c46ece7b303a862c3e70dbba469c2",
+  "mmuse/backbone_config.py": "78d7e2e708d8bc511f8b9843fa0de12abb0acf0c16360893a3232d07d244aebc",
+  "dflash/config.py": "50eda729c8242a483fa3a0758682c86d2dab40f71e0b83c87c8b29ecae3d0a6f",
+  "dspark/config.py": "41bfd9296a6cc65ba985194bc0691cdb0baeee7773cb7b7606b8b8dc97afca24",
+  "mmuse/config.py": "5101b6f0d000bbdf1ee0ac71e3fbee69604478a6b73fec2b7d29af36def7a26b",
+  "mmuse/backbone.py": "f7c55636a3ab505c8bc282a0b3ae0ff1c05c57719896a8def60cc7d13f87802a",
+  "mmuse/core.py": "a353bc9dbe6ab8407cb05207aed49d0ddfec1d5111d48a0249401e7517a046f1"
+}

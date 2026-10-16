@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Eager, single-device Qwen3 MMuse adapter using reference MMuse heads."""
+"""Eager, single-device Qwen3 MMuse adapter with standalone inference heads."""
 
 import weakref
 from collections.abc import Iterable
@@ -27,7 +27,7 @@ class MMuseDecoderLayer(DFlashQwen3DecoderLayer):
         self.attention_conv = None
         self.mlp_conv = None
         if getattr(config, "dflash2_dynamic_conv", False):
-            from speculators.models.mmuse.dynamic_conv import DFlash2GroupedConv
+            from vllm.model_executor.models.mmuse.dynamic_conv import DFlash2GroupedConv
 
             for name in ("attention_conv", "mlp_conv"):
                 setattr(
@@ -153,7 +153,7 @@ class MMuseQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def rollout_mmuse(self, hidden, anchor_ids):
         if not self._target_weights_bound:
             raise RuntimeError("MMuse target embedding/head have not been bound")
-        # This preserves Selector, causal cache, feedback and Markov operation order.
+        # The local rollout preserves Selector, cache, feedback and Markov order.
         return self.runtime.rollout_correction(hidden, anchor_ids, temperature=0.0)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

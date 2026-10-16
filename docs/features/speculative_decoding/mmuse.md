@@ -1,7 +1,7 @@
 # MMuse reference adapter for Qwen3
 
-This experimental adapter connects the matching local Speculators MMuse training
-implementation to Model Runner V2. It has not been validated with a trained
+This experimental adapter includes standalone MMuse inference components for
+Model Runner V2. It has not been validated with a trained
 `qwen3_4b_mmuse` checkpoint or a GPU/NPU serving run. CPU component comparisons
 do not establish end-to-end correctness or speedup.
 
@@ -14,7 +14,8 @@ do not establish end-to-end correctness or speedup.
 - Greedy draft proposals, eager target and draft execution, one device.
 - No quantization, watermarking or adaptive verification.
 
-The runtime validates these restrictions. Model Runner V1 rejects MMuse explicitly.
+These are implementation limits; commenting out a configuration check does not
+add support for that mode. Model Runner V1 rejects MMuse explicitly.
 The target's generation temperature is separate from the draft sampling mode;
 start evaluation with greedy target requests as well.
 
@@ -32,8 +33,8 @@ conditioning are retained. Last accepted normalized context features are gathere
 per request before query preparation; rejected target features are not used for
 the context residual.
 
-`build_mmuse_runtime` constructs only source MMuse heads and feature modules, not
-a second decoder or verifier. It invokes the original `rollout_correction()` for
+`build_mmuse_runtime` constructs local MMuse heads and feature modules, not
+a second decoder or verifier. Its inference-only `rollout_correction()` preserves
 Selector conditioning, causal Correction cache, hidden/logit feedback and optional
 Markov collaboration. Correction cache and feedback are initialized within each
 rollout, rather than reused across requests or proposal rounds.
@@ -47,10 +48,16 @@ adaptive proposal length in this first version.
 
 ## Environment and launch template
 
-The exact matching training checkout must be importable as `speculators` in the
-inference environment, including its dependencies. This reference adapter is not
-a standalone replacement for that package. Preserve the training checkout SHA,
-patches, config, tokenizer and target/checkpoint hashes with evaluation results.
+Deployment needs vLLM, vLLM-Ascend when using NPU, their runtime dependencies,
+and the target/draft checkpoints. It does not need the training checkout or the
+`speculators`/`hs_connectors` packages. Checkpoint identity still uses the existing
+`speculators_model_type` field; that field is a format marker, not a Python import.
+
+Inference modules live in `vllm/model_executor/models/mmuse/`: config parsing,
+feature fusion, dynamic convolution, Selector, Correction, Markov/confidence heads,
+and rollout feedback. Training losses, data loading and optimizers are excluded.
+`NOTICE`, `LICENSE`, and `source_manifest.json` record source attribution and hashes.
+Preserve training provenance, tokenizer and target/checkpoint hashes for evaluation.
 
 Example on a server with the correct vLLM/Ascend installation and dependencies:
 
@@ -67,10 +74,13 @@ Do not edit a checkpoint's feature switches to bypass missing-weight errors.
 
 ## Validation still required
 
-The workspace test `checks/test_mmuse_adapter.py` compares source/runtime heads
+The development-only test `checks/test_mmuse_adapter.py` compares source/runtime heads
 on fixed synthetic weights, query conditioning, decoder convolution/residual
 ordering with a substituted Attention sublayer, request anchor selection, and
-proposal output layout. It does not execute native vLLM Attention kernels.
+proposal output layout. Its subprocess smoke test blocks all `speculators` imports
+while constructing config, loading synthetic weights and executing rollout and
+dynamic convolution. Only the numerical reference tests need the training checkout.
+These tests do not execute native vLLM Attention kernels.
 
 Before claiming service support, compare the complete backbone and logits on
 the actual backend, then validate at least two proposal/verification rounds,
