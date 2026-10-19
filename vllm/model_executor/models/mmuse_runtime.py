@@ -13,16 +13,28 @@ def build_mmuse_runtime(source_config: dict, fc: nn.Module) -> nn.Module:
 
 
 def validate_mmuse_config(config) -> None:
-    """Reject execution modes not covered by the reference adapter."""
+    """Check required model interfaces and currently supported execution modes.
+
+    This check does not validate checkpoint tensors or end-to-end correctness.
+    Detailed MMuse option validation belongs to MMuseRuntimeConfig.
+    """
     spec = config.speculative_config
     hf = spec.draft_model_config.hf_config
     source = getattr(hf, "mmuse_source_config", None)
+
+    # Required configuration and interfaces used by the Qwen3 adapter.
     if not source:
         raise ValueError("MMuse requires a Speculators-format MMuse checkpoint")
     if config.model_config.hf_config.model_type != "qwen3":
         raise ValueError("MMuse reference adapter requires a Qwen3 target")
     if source["transformer_layer_config"].get("model_type") != "qwen3":
         raise ValueError("MMuse reference adapter requires a Qwen3 draft decoder")
+    layer_ids = source["aux_hidden_state_layer_ids"]
+    num_layers = config.model_config.get_total_num_hidden_layers()
+    if not layer_ids or any(i < 1 or i > num_layers for i in layer_ids):
+        raise ValueError("MMuse auxiliary layer IDs exceed the target's layer range")
+
+    # Execution modes not yet covered by this adapter.
     parallel = config.parallel_config
     for name in (
         "tensor_parallel_size",
@@ -33,8 +45,13 @@ def validate_mmuse_config(config) -> None:
     ):
         if getattr(parallel, name, 1) != 1:
             raise ValueError(f"MMuse reference adapter requires {name}=1")
-    # if not config.model_config.enforce_eager or not spec.enforce_eager:
-    #     raise ValueError("MMuse requires target and draft enforce_eager=True")
+    if any(
+        layer_type != "full_attention"
+        for layer_type in (getattr(hf, "layer_types", None) or [])
+    ):
+        raise ValueError("MMuse reference adapter requires full-attention draft layers")
+
+    # Additional contracts for the probabilistic sampler and its logits cache.
     if spec.draft_sample_method == "probabilistic":
         if not config.model_config.enforce_eager or not spec.enforce_eager:
             raise ValueError("MMuse probabilistic drafting requires enforce_eager=True")
@@ -54,34 +71,6 @@ def validate_mmuse_config(config) -> None:
             raise ValueError(
                 "MMuse num_speculative_tokens must equal trained block_size"
             )
-    # if spec.enable_adaptive_verification:
-    #     raise ValueError("MMuse adaptive verification is not implemented")
-    # if getattr(config, "watermark_config", None) is not None:
-    #     raise ValueError("MMuse reference adapter does not support watermarking")
-    # if config.model_config.quantization or spec.draft_model_config.quantization:
-    #     raise ValueError("MMuse reference adapter requires unquantized weights")
-    # if not source.get("sample_from_anchor", True):
-    #     raise ValueError("MMuse reference adapter requires sample_from_anchor=True")
-    # if spec.num_speculative_tokens != source["block_size"]:
-    #     raise ValueError("MMuse num_speculative_tokens must equal trained block_size")
-    # if not source.get("enable_correction_head", False):
-    #     raise ValueError("MMuse reference adapter requires a Correction head")
-    # if not source.get("use_aux_hidden_state", True):
-    #     raise ValueError("MMuse reference adapter requires auxiliary hidden states")
-    # vocab_size = config.model_config.get_vocab_size()
-    # if (source.get("draft_vocab_size") or hf.vocab_size) != vocab_size:
-    #     raise ValueError("MMuse requires the full target vocabulary")
-    # if hf.hidden_size != config.model_config.get_hidden_size():
-    #     raise ValueError("MMuse target and draft hidden sizes must match")
-    if any(
-        layer_type != "full_attention"
-        for layer_type in (getattr(hf, "layer_types", None) or [])
-    ):
-        raise ValueError("MMuse reference adapter requires full-attention draft layers")
-    layer_ids = source["aux_hidden_state_layer_ids"]
-    num_layers = config.model_config.get_total_num_hidden_layers()
-    if not layer_ids or any(i < 1 or i > num_layers for i in layer_ids):
-        raise ValueError("MMuse auxiliary layer IDs exceed the target's layer range")
 
 
 class MMuseGreedyRolloutMixin:
