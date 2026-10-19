@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for MMuse graph dispatch; no accelerator capture is simulated."""
 
+import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -190,3 +191,70 @@ def test_forward_mode_block_shape_and_sampling(
     )
     torch.testing.assert_close(obj.draft_tokens[:num_reqs], expected)
     assert (obj.draft_tokens[num_reqs:] == -1).all()
+
+
+@pytest.mark.parametrize("block_size", [7, 15])
+@pytest.mark.parametrize("compilation_mode", [0, 3])
+def test_full_graph_config_covers_target_and_draft_without_rounding_loss(
+    block_size, compilation_mode
+):
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "vllm/model_executor/models/mmuse/graph_config.py"
+    )
+    spec = importlib.util.spec_from_file_location("mmuse_graph_config_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    result = module.build_mmuse_full_graph_config(
+        block_size, 4, compilation_mode=compilation_mode
+    )
+    assert result["mode"] == compilation_mode
+    assert result["cudagraph_mode"] == "FULL"
+    sizes = result["cudagraph_capture_sizes"]
+    assert sizes == sorted(set(sizes))
+    for batch in (1, 2, 3, 4):
+        assert batch * block_size in sizes
+        assert batch * (block_size + 1) in sizes
+    assert result["max_cudagraph_capture_size"] == sizes[-1]
+
+
+@pytest.mark.parametrize("mmuse", [True, False])
+@pytest.mark.parametrize("fail", [True, False])
+def test_prepared_draft_metadata_is_scoped_to_one_replay(mmuse, fail):
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    branch = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and node.body
+        and isinstance(node.body[0], ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "_mmuse_replay_attn_metadata"
+            for target in node.body[0].targets
+        )
+    )
+    metadata = object()
+
+    def replay(desc):
+        if mmuse:
+            assert obj._mmuse_replay_attn_metadata is metadata
+        if fail:
+            raise RuntimeError("replay failed")
+
+    obj = SimpleNamespace(
+        speculative_config=SimpleNamespace(use_mmuse=lambda: mmuse),
+        query_cudagraph_manager=SimpleNamespace(run_fullgraph=replay),
+    )
+    namespace = {"self": obj, "draft_attn_metadata": metadata, "batch_desc": object()}
+    code = compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec")
+    if fail:
+        with pytest.raises(RuntimeError, match="replay failed"):
+            exec(code, namespace)
+    else:
+        exec(code, namespace)
+    assert getattr(obj, "_mmuse_replay_attn_metadata", None) is None

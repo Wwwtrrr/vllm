@@ -739,9 +739,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if self.speculative_config is not None and self.speculative_config.use_mmuse():
             logger.info(
-                "MMuse target graph setup: enforce_eager=%s, selected_mode=%s, "
+                "MMuse target graph setup: enforce_eager=%s, compilation_mode=%s, "
+                "selected_mode=%s, "
                 "capture_planned=%s. Capture planning does not confirm request replay.",
                 self.model_config.enforce_eager,
+                self.compilation_config.mode,
                 cudagraph_mode,
                 self.cudagraph_manager.needs_capture(),
             )
