@@ -505,6 +505,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            if self.speculative_config.use_mmuse() and not dummy_run:
+                logger.info_once("MMuse draft FULL graph replay submitted.")
         else:
             self._generate_draft(
                 num_reqs,
@@ -514,6 +516,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
+            if self.speculative_config.use_mmuse() and not dummy_run:
+                logger.info_once(
+                    "MMuse draft eager execution observed; this batch did not "
+                    "replay a FULL graph."
+                )
 
         return self.draft_tokens[:num_reqs]
 
