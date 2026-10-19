@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Single-device Qwen3 MMuse adapter with standalone inference heads."""
+"""Eager, single-device Qwen3 MMuse adapter with standalone inference heads."""
 
 import weakref
 from collections.abc import Iterable

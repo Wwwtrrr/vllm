@@ -1,10 +1,9 @@
 # MMuse reference adapter for Qwen3
 
 This experimental adapter includes standalone MMuse inference components for
-Model Runner V2. Greedy serving with a real checkpoint has been reported by the
-user. FULL graphs and probabilistic graph serving have not been validated in
-the development environment. CPU component comparisons do not establish
-end-to-end correctness or speedup.
+Model Runner V2. It has not been validated with a trained
+`qwen3_4b_mmuse` checkpoint or a GPU/NPU serving run. CPU component comparisons
+do not establish end-to-end correctness or speedup.
 
 ## Supported first-stage contract
 
@@ -12,8 +11,7 @@ end-to-end correctness or speedup.
 - Speculators-format `speculators_model_type="mmuse"` configuration.
 - `sample_from_anchor=True`, full-attention draft layers, enabled Correction.
 - Fixed proposal length equal to the trained block size (typically 7).
-- Greedy or probabilistic draft proposals, one device.
-- Eager or experimental FULL graph execution; no piecewise draft graphs.
+- Greedy or probabilistic draft proposals, eager execution, one device.
 - No quantization, watermarking or adaptive verification.
 
 These are implementation limits; commenting out a configuration check does not
@@ -34,139 +32,6 @@ remain greedy, including within a mixed batch. Watermarking and adaptive
 verification are rejected for this new path. GPU/NPU end-to-end validation of
 probabilistic MMuse remains required; previous greedy serving results do not
 validate this extension.
-
-## Target and Draft FULL graphs (experimental)
-
-### Native FULL versus compiled FULL
-
-Graph replay and torch compilation must be controlled independently. Start with
-`compilation_config={"mode":0,"cudagraph_mode":"FULL", ...}` to capture native
-operators without adding compilation passes. This is not `enforce_eager=True`,
-which disables graphs too. Mode 3 is a separate opt-in compiled-FULL experiment.
-Neither route has a measured speedup guarantee in this development environment.
-
-Use the explicit configuration builder to cover both query widths:
-
-```python
-from vllm.model_executor.models.mmuse.graph_config import (
-    build_mmuse_full_graph_config,
-)
-
-enforce_eager = False
-compilation_config = build_mmuse_full_graph_config(
-    block_size=7, max_num_seqs=4, compilation_mode=0,
-)
-# Pass both to LLM; set speculative_config["enforce_eager"] = False for Draft FULL.
-```
-
-For block size 7 this produces `[1,7,8,14,16,21,24,28,32]`; for 15 it produces
-`[1,15,16,30,32,45,48,60,64]`. Sizes are shared by target/draft managers; draft
-queries use K positions and typical target verification uses K+1. The builder
-does not alter checkpoint fields or global compilation defaults.
-
-Ascend's current platform setup forces compilation mode NONE when graph mode
-is NONE, so setting mode=3 with graph NONE does not provide a reliable
-"compiled-only" experiment on this version. `compilation_config=None` means
-defaults, which can enable graphs; it is not an off switch.
-
-Target forward uses the existing V2 target graph manager. MMuse query forward,
-Correction and draft sampling use the DFlash query graph manager; Ascend keeps
-its ACL graph metadata and update-stream implementation. MMuse passes the actual
-capture mode to its forward context. The DFlash manager selects full decode-only
-query graphs and may fall back to eager if its attention backend cannot capture
-them. Target sampling/rejection is not implied to be inside the target graph.
-
-For MMuse, the query speculator passes prepared per-batch metadata to the Ascend
-replay manager through a scoped reference, cleared even if replay raises. The
-ACL manager updates padded query lengths on that metadata instead of building
-it a second time. Graph backend resolution/replay runs under the manager's
-current VllmConfig; legacy MMuse task updates use draft metadata in the forward
-context. Other DFlash methods retain their metadata construction path.
-This does not remove required graph task updates or stream dependencies.
-
-Use these switches to isolate behavior:
-
-| Test | Target `--enforce-eager` | Draft `enforce_eager` | Compilation graph mode |
-| --- | --- | --- | --- |
-| Baseline | present | `true` | `NONE` |
-| Target FULL, Draft eager | absent | `true` | `FULL` |
-| Target FULL, Draft FULL | absent | `false` | `FULL` |
-
-Target eager with Draft FULL is not provided as an independent mode: the parent
-capture flow initializes and captures the draft from the target's graph setup.
-This change does not introduce a separate draft-only graph driver.
-
-Example (change paths and block length to match the actual checkpoints):
-
-```bash
-export VLLM_USE_V2_MODEL_RUNNER=1
-vllm serve /path/to/Qwen3-4B \
-  --tensor-parallel-size 1 \
-  --compilation-config '{"mode":0,"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,15,16,30,32,45,48,60,64]}' \
-  --speculative-config '{"method":"mmuse","model":"/path/to/qwen3_4b_mmuse","num_speculative_tokens":15,"enforce_eager":false,"draft_sample_method":"probabilistic"}'
-```
-
-The graph path requires full trained blocks and `sample_from_anchor=True`.
-Static global Selector still requires draft eager because its validation reads
-a device tensor from Python. Corrected online feedback does not execute that
-whole-block global-path validation. Existing single-device/full-attention
-restrictions remain; graph support does not add quantization or parallelism.
-
-Logs distinguish planning, completed capture and real-request replay submission:
-
-```text
-MMuse target graph setup: ...
-MMuse draft graph setup: ...
-MMuse target graph capture completed: ...
-MMuse draft FULL graph capture completed: ...
-MMuse target FULL graph replay submitted.
-MMuse draft FULL graph replay submitted.
-```
-
-Replay logs exclude dummy/profile batches and print once. Submission is not a
-device synchronization or numerical-correctness check. Eager execution observed
-for an individual batch is also logged once; a large prefill may use eager even
-when decode batches replay FULL graphs. Capture planning or startup alone is
-not proof of replay. No extra device-to-host synchronization is added for logs.
-
-Run real-checkpoint tests separately so graph and eager engines do not occupy
-device memory at the same time:
-
-```bash
-python examples/offline_inference/mmuse_full_graph.py \
-  --target /path/to/Qwen3-4B --draft /path/to/qwen3_4b_mmuse \
-  --block-size 15 --mode eager --output eager.json
-python examples/offline_inference/mmuse_full_graph.py \
-  --target /path/to/Qwen3-4B --draft /path/to/qwen3_4b_mmuse \
-  --block-size 15 --mode target-full --output target-full.json
-python examples/offline_inference/mmuse_full_graph.py \
-  --target /path/to/Qwen3-4B --draft /path/to/qwen3_4b_mmuse \
-  --block-size 15 --mode both-full --output both-full.json
-```
-
-The script exercises batches 1/2/4/2/1 with fixed per-request seeds and stores
-token IDs, finish reasons and warmed generation times. It disables prefix
-caching and warms batch sizes 1/2/4 before measurement. Model initialization,
-graph capture and warmup are not timed. Start with its greedy defaults, compare outputs
-and inspect both replay messages. Then repeat with
-`--draft-sample-method probabilistic --temperature 0.7` and new output filenames.
-Stochastic output equality alone does not prove distribution correctness, and
-floating-point differences can change greedy decisions near ties. Validate
-proposal logits/cache, full/partial rejection, EOS and cancellation separately.
-The script is a serving smoke test, not a latency or throughput benchmark.
-
-The script now defaults to native FULL (`--compilation-mode 0`); repeat with
-`--compilation-mode 3` and different output names to isolate compiled FULL.
-Use `--without-draft --mode target-full` to test the plain target without any
-MMuse execution (omit `--draft`). This is important when native target-only
-graph execution already exhibits the regression. Keep the same physical
-device, requests and profiler settings across comparisons. Profile separately
-from timing; synchronous profiler parsing must not be included in generation
-performance results.
-
-CPU dispatch tests are in `tests/v1/spec_decode/test_mmuse_graph.py`; they do not
-capture CUDA/ACL graphs. Accelerator and real-checkpoint validation remain
-required before claiming FULL support or speedup.
 
 ## Implementation
 

@@ -737,16 +737,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             varlen_decode=self.adaptive_verification is not None,
             ubatch_runner=self.ubatch_runner,
         )
-        if self.speculative_config is not None and self.speculative_config.use_mmuse():
-            logger.info(
-                "MMuse target graph setup: enforce_eager=%s, compilation_mode=%s, "
-                "selected_mode=%s, "
-                "capture_planned=%s. Capture planning does not confirm request replay.",
-                self.model_config.enforce_eager,
-                self.compilation_config.mode,
-                cudagraph_mode,
-                self.cudagraph_manager.needs_capture(),
-            )
         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
             self.fast_prefill = FastPrefillHelper(
                 self.cudagraph_manager, self.max_num_tokens
@@ -1077,14 +1067,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self.lora_config, self
                         ),
                     )
-                    if (
-                        self.speculative_config is not None
-                        and self.speculative_config.use_mmuse()
-                    ):
-                        logger.info(
-                            "MMuse target graph capture completed: token_sizes=%s.",
-                            self.cudagraph_manager.captured_token_counts(),
-                        )
                     if self.speculator is not None:
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
@@ -1980,12 +1962,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 **connector_kwargs, attn_metadata=attn_metadata
             )
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-            if (
-                self.speculative_config is not None
-                and self.speculative_config.use_mmuse()
-                and not dummy_run
-            ):
-                logger.info_once("MMuse target FULL graph replay submitted.")
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -2026,16 +2002,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.use_mmuse()
-            and not dummy_run
-            and batch_desc.cg_mode == CUDAGraphMode.NONE
-        ):
-            logger.info_once(
-                "MMuse target eager execution observed; this batch did not replay "
-                "a FULL graph."
-            )
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
