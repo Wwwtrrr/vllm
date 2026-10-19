@@ -50,11 +50,24 @@ def validate_mmuse_config(config) -> None:
         for layer_type in (getattr(hf, "layer_types", None) or [])
     ):
         raise ValueError("MMuse reference adapter requires full-attention draft layers")
+    if not spec.enforce_eager:
+        if not source.get("sample_from_anchor", True):
+            raise ValueError("MMuse draft graphs require sample_from_anchor=True")
+        if spec.num_speculative_tokens != source["block_size"]:
+            raise ValueError(
+                "MMuse draft graphs require the complete trained block_size"
+            )
+        if (
+            source.get("dflash2_candidate_selector", False)
+            and source.get("selector_correction_feedback", "static") == "static"
+            and source.get("dflash2_selector_search_mode", "greedy") == "global"
+        ):
+            raise ValueError(
+                "MMuse static global Selector requires draft enforce_eager=True"
+            )
 
     # Additional contracts for the probabilistic sampler and its logits cache.
     if spec.draft_sample_method == "probabilistic":
-        if not config.model_config.enforce_eager or not spec.enforce_eager:
-            raise ValueError("MMuse probabilistic drafting requires enforce_eager=True")
         if getattr(config, "watermark_config", None) is not None:
             raise ValueError(
                 "MMuse probabilistic drafting does not support watermarking"
@@ -75,6 +88,38 @@ def validate_mmuse_config(config) -> None:
 
 class MMuseGreedyRolloutMixin:
     """Shared GPU/NPU rollout with greedy or framework probabilistic sampling."""
+
+    def init_cudagraph_manager(self, cudagraph_mode):
+        from vllm.config.compilation import CUDAGraphMode
+        from vllm.logger import init_logger
+
+        if self.speculative_config.enforce_eager:
+            cudagraph_mode = CUDAGraphMode.NONE
+        super().init_cudagraph_manager(cudagraph_mode)
+        manager = self.query_cudagraph_manager
+        init_logger(__name__).info(
+            "MMuse draft graph setup: enforce_eager=%s, manager=%s, "
+            "capture_planned=%s, query_length=%d. "
+            "Capture planning does not confirm request replay.",
+            self.speculative_config.enforce_eager,
+            type(manager).__name__,
+            manager is not None and manager.needs_capture(),
+            self.num_query_per_req,
+        )
+
+    def capture(self):
+        from vllm.logger import init_logger
+
+        logger = init_logger(__name__)
+        manager = self.query_cudagraph_manager
+        if manager is None or not manager.needs_capture():
+            logger.info("MMuse draft graph capture skipped; draft will run eagerly.")
+            return
+        super().capture()
+        logger.info(
+            "MMuse draft FULL graph capture completed: token_sizes=%s.",
+            manager.captured_token_counts(),
+        )
 
     def _mmuse_gumbel_sample(self, *args, **kwargs):
         from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -131,7 +176,11 @@ class MMuseGreedyRolloutMixin:
             attn_metadata,
             slot_mappings,
             num_tokens_across_dp,
-            CUDAGraphMode.NONE,
+            (
+                CUDAGraphMode.NONE
+                if cudagraph_runtime_mode is None
+                else cudagraph_runtime_mode
+            ),
         )
         if not num_reqs:
             return
