@@ -71,19 +71,13 @@ is NONE, so setting mode=3 with graph NONE does not provide a reliable
 defaults, which can enable graphs; it is not an off switch.
 
 Target forward uses the existing V2 target graph manager. MMuse query forward,
-Correction and draft sampling use the DFlash query graph manager; Ascend keeps
-its ACL graph metadata and update-stream implementation. MMuse passes the actual
-capture mode to its forward context. The DFlash manager selects full decode-only
-query graphs and may fall back to eager if its attention backend cannot capture
-them. Target sampling/rejection is not implied to be inside the target graph.
-
-For MMuse, the query speculator passes prepared per-batch metadata to the Ascend
-replay manager through a scoped reference, cleared even if replay raises. The
-ACL manager updates padded query lengths on that metadata instead of building
-it a second time. Graph backend resolution/replay runs under the manager's
-current VllmConfig; legacy MMuse task updates use draft metadata in the forward
-context. Other DFlash methods retain their metadata construction path.
-This does not remove required graph task updates or stream dependencies.
+Correction and draft sampling use the DFlash query graph manager, the same FULL
+replay path as DSpark. Ascend rebuilds draft-decoder attention metadata on each
+replay with `build_draft_attn_metadatas`. Correction is a block-local SDPA loop
+and does not use that metadata or the paged KV cache. The DFlash manager selects
+full decode-only query graphs and may fall back to eager if its attention
+backend cannot capture them. Target sampling/rejection is not implied to be
+inside the target graph.
 
 Use these switches to isolate behavior:
 

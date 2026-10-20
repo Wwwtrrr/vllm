@@ -504,17 +504,11 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
-            if self.speculative_config.use_mmuse():
-                # Ascend can reuse this batch's metadata for ACL task updates.
-                self._mmuse_replay_attn_metadata = draft_attn_metadata
-                try:
-                    self.query_cudagraph_manager.run_fullgraph(batch_desc)
-                finally:
-                    self._mmuse_replay_attn_metadata = None
-            else:
-                self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            self.query_cudagraph_manager.run_fullgraph(batch_desc)
             if self.speculative_config.use_mmuse() and not dummy_run:
-                logger.info_once("MMuse draft FULL graph replay submitted.")
+                logger.info_once(
+                    "%s draft FULL graph replay submitted.", self._speculator_name
+                )
         else:
             self._generate_draft(
                 num_reqs,
@@ -526,8 +520,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
             if self.speculative_config.use_mmuse() and not dummy_run:
                 logger.info_once(
-                    "MMuse draft eager execution observed; this batch did not "
-                    "replay a FULL graph."
+                    "%s draft eager execution observed; this batch did not "
+                    "replay a FULL graph.",
+                    self._speculator_name,
                 )
 
         return self.draft_tokens[:num_reqs]
