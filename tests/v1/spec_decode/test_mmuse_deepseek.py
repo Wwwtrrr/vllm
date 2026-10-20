@@ -96,6 +96,116 @@ def test_dense_draft_attention_config_is_isolated_from_quantized_target():
     )
 
 
+def test_anchor_mask_keeps_fixed_context_and_causal_query_block():
+    module = load_module(
+        "vllm/model_executor/models/mmuse/anchor_attention.py", "anchor_mask_test"
+    )
+    actual = module.anchor_mask(torch.arange(8), torch.arange(8, 15), 4, True)
+    assert not actual[:, :4].any()
+    assert actual[:, 4:8].all()
+    assert torch.equal(actual[:, 8:], torch.ones(7, 7, dtype=torch.bool).tril())
+
+
+def test_anchor_cache_reserved_storage_and_request_slot_reuse():
+    module = load_module(
+        "vllm/model_executor/models/mmuse/anchor_attention.py", "anchor_cache_test"
+    )
+    storage = torch.empty(2, 4, 16)
+    cache = module.AnchorContextCache(4, storage)
+    features = torch.randn(8, 16)
+    cache.update(0, "a", torch.arange(5), features[:5])
+    positions, stored = cache.update(0, "a", torch.arange(5, 8), features[5:])
+    assert positions.tolist() == [4, 5, 6, 7]
+    assert stored.data_ptr() == storage[0].data_ptr()
+    torch.testing.assert_close(stored, features[4:])
+    cache.update(1, "b", torch.arange(2), features[:2])
+    cache.update(0, "c", torch.arange(1), features[:1])
+    assert cache.entries[1][0] == "b"
+    assert cache.entries[0][0] == "c"
+    with pytest.raises(ValueError, match="missing.*prefix"):
+        cache.update(0, "d", torch.arange(9, 11), features[:2])
+
+
+def test_anchor_context_hook_excludes_rejected_target_suffix(monkeypatch):
+    import sys
+
+    helper = load_module(
+        "vllm/model_executor/models/mmuse/anchor_attention.py", "anchor_hook_test"
+    )
+    runtime = load_module("vllm/model_executor/models/mmuse_runtime.py", "anchor_hook")
+    cache = helper.AnchorContextCache(4, torch.empty(3, 4, 16))
+    states = torch.randn(6, 16)
+    model = NS(
+        model=NS(context_anchor=torch.zeros(2, 16), hidden_norm=lambda x: x),
+        anchor_context_cache=cache,
+    )
+    obj = NS(
+        model=model,
+        _mmuse_anchor_active=True,
+        hidden_states=states,
+        target_input_buffers=NS(positions=torch.tensor([0, 1, 2, 0, 1, 2])),
+    )
+    batch = NS(
+        num_reqs=2,
+        query_start_loc=torch.tensor([0, 3, 6]),
+        idx_mapping_np=[2, 0],
+        req_ids=["a", "b"],
+    )
+    monkeypatch.setitem(
+        sys.modules, "vllm.model_executor.models.mmuse.anchor_attention", helper
+    )
+    runtime.MMuseGreedyRolloutMixin.prepare_context_anchor(
+        obj, batch, torch.tensor([1, 0])
+    )
+    assert cache.entries[2][1].tolist() == [0, 1]
+    torch.testing.assert_close(cache.entries[2][2], states[:2])
+    torch.testing.assert_close(cache.entries[0][2], states[3:])
+    assert len(model._anchor_contexts) == 2
+
+
+def test_anchor_attention_rejects_prefix_cache_without_hidden_history():
+    runtime = load_module("vllm/model_executor/models/mmuse_runtime.py", "prefix_check")
+    config = configuration()
+    config.cache_config = NS(enable_prefix_caching=True)
+    with pytest.raises(ValueError, match="enable_prefix_caching=False"):
+        runtime.validate_mmuse_config(config)
+
+
+@pytest.mark.parametrize("dummy", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_anchor_proposal_context_is_scoped_and_dummy_uses_native(dummy, fail):
+    runtime = load_module("vllm/model_executor/models/mmuse_runtime.py", "anchor_scope")
+    seen = []
+
+    class Parent:
+        def propose(self, *args, **kwargs):
+            seen.append(self._mmuse_anchor_active)
+            self.model._anchor_contexts = object()
+            if fail:
+                raise RuntimeError("proposal failed")
+            return "tokens"
+
+    class Adapter(runtime.MMuseGreedyRolloutMixin, Parent):
+        pass
+
+    adapter = Adapter()
+    adapter.draft_model_config = NS(
+        hf_config=NS(
+            target_hidden_state_format="deepseek_v4_mean_hc_head",
+            layer_types=["sliding_attention"],
+        )
+    )
+    adapter.model = NS()
+    if fail:
+        with pytest.raises(RuntimeError, match="proposal failed"):
+            adapter.propose(dummy_run=dummy)
+    else:
+        assert adapter.propose(dummy_run=dummy) == "tokens"
+    assert seen == [not dummy]
+    assert adapter.model._anchor_contexts is None
+    assert not adapter._mmuse_anchor_active
+
+
 @pytest.mark.parametrize("tp", [1, 2, 4])
 def test_deepseek_dense_contract_accepts_native_tp_and_mixed_attention(tp):
     module = load_module(

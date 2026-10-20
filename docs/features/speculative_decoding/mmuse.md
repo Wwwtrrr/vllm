@@ -119,6 +119,23 @@ to one. The runtime proposal length must equal the checkpoint's `block_size`.
 Ascend's cache planner retains both native DeepSeek cache groups and dense draft
 cache groups in the native shared backing allocation.
 
+For a DeepSeek MMuse draft with sliding-attention layers, real eager proposals
+use explicit anchor-relative SDPA attention. Training exposes the same context
+interval `[anchor-window, anchor)` to every slot, while ordinary paged SWA moves
+the interval with each query. The eager path retains verified target features
+per persistent request slot and ID, excludes rejected rows, and recomputes the
+dense draft K/V from that history. It does not read the paged draft SWA cache.
+Native draft attention remains in dummy/profile runs. This path requires
+`enable_prefix_caching=False`, since reused target prefix KV does not supply
+the intermediate features needed to reconstruct draft context.
+
+Feature-history storage is reserved at model initialization for memory profiling.
+All-sliding drafts reserve `max_num_seqs * sliding_window * hidden_size` elements;
+mixed full/sliding drafts retain up to the draft maximum model length instead.
+This is an eager correctness path, with additional memory, host synchronization
+and context projection cost. Native NPU execution, throughput and acceptance
+still need server validation; this change does not promise an acceptance-rate fix.
+
 Run `examples/offline_inference/mmuse_deepseek_smoke.py` on the server with the
 same environment and target quantization settings that already run the target:
 

@@ -116,6 +116,13 @@ def validate_mmuse_deepseek_v4_config(config, source) -> None:
             "DeepSeek-V4 MMuse requires BF16 activations, "
             "independently of target weight quantization"
         )
+    if "sliding_attention" in (getattr(hf, "layer_types", None) or []) and getattr(
+        getattr(config, "cache_config", None), "enable_prefix_caching", False
+    ):
+        raise ValueError(
+            "DeepSeek-V4 MMuse anchor attention requires enable_prefix_caching=False "
+            "to retain verified target features for every request"
+        )
     if hf.hidden_size != target.get_hidden_size():
         raise ValueError(
             "DeepSeek-V4 MMuse borrowed embedding/head require "
@@ -168,6 +175,28 @@ def validate_mmuse_deepseek_v4_config(config, source) -> None:
 
 class MMuseGreedyRolloutMixin:
     """Shared GPU/NPU rollout with greedy or framework probabilistic sampling."""
+
+    def propose(self, *args, **kwargs):
+        dummy_run = kwargs.get("dummy_run", args[12] if len(args) > 12 else False)
+        source = self.draft_model_config.hf_config
+        self._mmuse_anchor_active = (
+            not dummy_run
+            and getattr(source, "target_hidden_state_format", None)
+            == "deepseek_v4_mean_hc_head"
+            and "sliding_attention" in (getattr(source, "layer_types", None) or [])
+        )
+        try:
+            return super().propose(*args, **kwargs)
+        finally:
+            self._mmuse_anchor_active = False
+            if hasattr(self, "model"):
+                self.model._anchor_contexts = None
+
+    def _precompute_context_kv(self, start, end, dummy_run=False):
+        if getattr(self, "_mmuse_anchor_active", False):
+            # Anchor attention projects the verified feature history directly.
+            return
+        return super()._precompute_context_kv(start, end, dummy_run)
 
     @property
     def attn_vllm_config(self):
@@ -228,6 +257,24 @@ class MMuseGreedyRolloutMixin:
         anchor[:count].copy_(
             self.model.model.hidden_norm(self.hidden_states[indices]) * valid[:, None]
         )
+        if getattr(self, "_mmuse_anchor_active", False):
+            if hasattr(self.model, "_anchor_feature_storage"):
+                self.model.anchor_context_cache.storage = (
+                    self.model._anchor_feature_storage
+                )
+            contexts = []
+            for row, (start, end) in enumerate(zip(starts.tolist(), ends.tolist())):
+                if end <= start:
+                    raise ValueError("MMuse anchor path requires verified context rows")
+                contexts.append(
+                    self.model.anchor_context_cache.update(
+                        int(input_batch.idx_mapping_np[row]),
+                        input_batch.req_ids[row],
+                        self.target_input_buffers.positions[start:end],
+                        self.hidden_states[start:end],
+                    )
+                )
+            self.model._anchor_contexts = contexts
 
     @torch.inference_mode()
     def _generate_draft(

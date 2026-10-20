@@ -16,6 +16,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.mmuse_runtime import (
     build_mmuse_runtime,
@@ -27,6 +28,8 @@ from vllm.model_executor.models.qwen3_mmuse import (
     _TargetHead,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
+
+logger = init_logger(__name__)
 
 
 class DeepseekV4MMuseForCausalLM(nn.Module):
@@ -59,6 +62,35 @@ class DeepseekV4MMuseForCausalLM(nn.Module):
         self.runtime.lm_head = _TargetHead(self)
         self.model._runtime_ref = weakref.ref(self.runtime)
         self._target_weights_bound = False
+        layer_types = getattr(self.config, "layer_types", None) or []
+        if "sliding_attention" in layer_types:
+            from vllm.model_executor.models.mmuse.anchor_attention import (
+                AnchorContextCache,
+            )
+
+            window = (
+                self.config.sliding_window
+                if all(t == "sliding_attention" for t in layer_types)
+                else None
+            )
+            history_size = (
+                window
+                or vllm_config.speculative_config.draft_model_config.max_model_len
+            )
+            # Allocate before the worker's memory profiling, not during serving.
+            self.register_buffer(
+                "_anchor_feature_storage",
+                torch.empty(
+                    vllm_config.scheduler_config.max_num_seqs,
+                    history_size,
+                    self.config.hidden_size,
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                persistent=False,
+            )
+            self.anchor_context_cache = AnchorContextCache(
+                window, self._anchor_feature_storage
+            )
 
     def bind_target_weights(self, target_model):
         target = (
@@ -112,6 +144,17 @@ class DeepseekV4MMuseForCausalLM(nn.Module):
         return self.model.embed_input_ids(input_ids)
 
     def forward(self, input_ids, positions, inputs_embeds=None):
+        contexts = getattr(self, "_anchor_contexts", None)
+        if contexts is not None:
+            from vllm.model_executor.models.mmuse.anchor_attention import (
+                forward_anchor_blocks,
+            )
+
+            logger.info_once(
+                "MMuse DeepSeek draft uses eager anchor-relative attention; "
+                "verified feature history replaces paged draft SWA reads."
+            )
+            return forward_anchor_blocks(self.model, input_ids, positions, contexts)
         return self.model(input_ids, positions, inputs_embeds)
 
     def get_draft_kv_cache_layer_names(self):
