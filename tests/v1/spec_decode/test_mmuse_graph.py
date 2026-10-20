@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU contracts for MMuse graph dispatch; no accelerator capture is simulated."""
 
-import ast
 import importlib.util
 import sys
 from pathlib import Path
@@ -219,43 +218,10 @@ def test_full_graph_config_covers_target_and_draft_without_rounding_loss(
     assert result["max_cudagraph_capture_size"] == sizes[-1]
 
 
-@pytest.mark.parametrize("mmuse", [True, False])
-@pytest.mark.parametrize("fail", [True, False])
-def test_prepared_draft_metadata_is_scoped_to_one_replay(mmuse, fail):
+def test_full_replay_does_not_stash_mmuse_metadata():
     path = (
         Path(__file__).resolve().parents[3]
         / "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
     )
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    branch = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and node.body
-        and isinstance(node.body[0], ast.Assign)
-        and any(
-            isinstance(target, ast.Attribute)
-            and target.attr == "_mmuse_replay_attn_metadata"
-            for target in node.body[0].targets
-        )
-    )
-    metadata = object()
-
-    def replay(desc):
-        if mmuse:
-            assert obj._mmuse_replay_attn_metadata is metadata
-        if fail:
-            raise RuntimeError("replay failed")
-
-    obj = SimpleNamespace(
-        speculative_config=SimpleNamespace(use_mmuse=lambda: mmuse),
-        query_cudagraph_manager=SimpleNamespace(run_fullgraph=replay),
-    )
-    namespace = {"self": obj, "draft_attn_metadata": metadata, "batch_desc": object()}
-    code = compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec")
-    if fail:
-        with pytest.raises(RuntimeError, match="replay failed"):
-            exec(code, namespace)
-    else:
-        exec(code, namespace)
-    assert getattr(obj, "_mmuse_replay_attn_metadata", None) is None
+    source = path.read_text(encoding="utf-8")
+    assert "_mmuse_replay_attn_metadata" not in source

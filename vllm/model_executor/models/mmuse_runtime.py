@@ -98,9 +98,10 @@ class MMuseGreedyRolloutMixin:
         super().init_cudagraph_manager(cudagraph_mode)
         manager = self.query_cudagraph_manager
         init_logger(__name__).info(
-            "MMuse draft graph setup: enforce_eager=%s, manager=%s, "
+            "%s draft graph setup: enforce_eager=%s, manager=%s, "
             "capture_planned=%s, query_length=%d. "
             "Capture planning does not confirm request replay.",
+            self._speculator_name,
             self.speculative_config.enforce_eager,
             type(manager).__name__,
             manager is not None and manager.needs_capture(),
@@ -113,11 +114,15 @@ class MMuseGreedyRolloutMixin:
         logger = init_logger(__name__)
         manager = self.query_cudagraph_manager
         if manager is None or not manager.needs_capture():
-            logger.info("MMuse draft graph capture skipped; draft will run eagerly.")
+            logger.info(
+                "%s draft graph capture skipped; draft will run eagerly.",
+                self._speculator_name,
+            )
             return
         super().capture()
         logger.info(
-            "MMuse draft FULL graph capture completed: token_sizes=%s.",
+            "%s draft FULL graph capture completed: token_sizes=%s.",
+            self._speculator_name,
             manager.captured_token_counts(),
         )
 
