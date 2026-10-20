@@ -363,6 +363,13 @@ class MMuseRuntimeConfig(MMuseOptions, DSparkSpeculatorConfig):
     @classmethod
     def from_checkpoint(cls, values: dict):
         values = dict(values)
+        if values.get("speculators_model_type") == "dspark":
+            from vllm.transformers_utils.configs.speculators.algos import (
+                is_deepseek_mmuse_export,
+            )
+
+            if is_deepseek_mmuse_export(values):
+                values["speculators_model_type"] = "mmuse"
         decoder = values.get("transformer_layer_config")
         if not isinstance(decoder, dict) or decoder.get("model_type") != "qwen3":
             raise ValueError("MMuse requires a Qwen3 transformer_layer_config")

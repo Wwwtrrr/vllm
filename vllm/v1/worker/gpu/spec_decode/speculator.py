@@ -50,6 +50,8 @@ def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
     resolved from the target model class because speculators are built before
     the target model is instantiated.
     """
+    if vllm_config.speculative_config.use_mmuse():
+        return False  # MMuse consumes mean-HC auxiliary states, not MTP residuals.
     from vllm.model_executor.model_loader.utils import get_model_cls
 
     target_cls = get_model_cls(vllm_config.model_config)

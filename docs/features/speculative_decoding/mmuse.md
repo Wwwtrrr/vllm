@@ -88,6 +88,55 @@ Do not edit a checkpoint's feature switches to bypass missing-weight errors.
 
 ## Validation still required
 
+### DeepSeek-V4 dense MMuse candidate adapter
+
+`DeepseekV4MMuseSpeculator` is a separate model entry for the dense drafter
+exported by this checkout's `speculators_dsv4` training path. It consumes
+`deepseek_v4_mean_hc_head` auxiliary features with one-based post-layer IDs.
+It does not consume the wide MTP HC residual. The teacher's final HC-head slot
+is used by training and must not appear in the auxiliary ID list.
+
+The trained draft decoder is Qwen3 dense attention, not the target's MLA/DSA
+architecture. Its full/sliding attention causality follows the training config.
+The export must contain `speculators_model_type="mmuse"`,
+`transformer_layer_config`, and `target_hidden_state_format`; an unrelated
+checkpoint is not converted by changing its model name. Raw MMuse exports are
+recognized even when their root `model_type` names the dense decoder.
+The DSpark-labelled export (`DSparkDraftModel`, `speculators_model_type="dspark"`)
+is also recognized when the DeepSeek mean-HC format, Qwen3 decoder, Correction,
+dynamic convolution and candidate Selector are explicitly present and enabled.
+Its original metadata is preserved; the in-memory runtime identity becomes
+MMuse. Baseline DSpark exports keep their existing loader. The actual tensors
+must still pass the strict MMuse trained-weight loading checks.
+
+This initial path requires BF16 activations and eager execution for both models.
+Target W4A8 is independent of the unquantized draft and its BF16 KV cache.
+Borrowed target embedding and output-head weights must be ordinary floating
+matrices; packed or quantized IO weights are rejected. Under TP, full embedding
+and head matrices are gathered once per rank for Correction, increasing memory.
+Target/draft TP must agree; pipeline/data/context parallelism remains restricted
+to one. The runtime proposal length must equal the checkpoint's `block_size`.
+Ascend's cache planner retains both native DeepSeek cache groups and dense draft
+cache groups in the native shared backing allocation.
+
+Run `examples/offline_inference/mmuse_deepseek_smoke.py` on the server with the
+same environment and target quantization settings that already run the target:
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=1
+python examples/offline_inference/mmuse_deepseek_smoke.py \
+  --target /home/data/deepseek-V4-flash-Dspark-w4a8-test \
+  --draft /home/data/deepseek-V4-flash-mmuse --tp 1
+```
+
+Use the TP degree required by the target hardware. The script reads the trained
+block size instead of assuming seven tokens. This is an integration smoke test,
+not a benchmark or proof of speculative sampling equivalence. Local CPU tests
+exercise configuration, synthetic IO weights, hidden-state routing and cache
+planning; they do not execute native kernels, real checkpoint loading, cache
+rollback or quantized serving. The optional training contract checks interfaces,
+not target checkpoint fingerprints. Verify target identity separately.
+
 The development-only test `checks/test_mmuse_adapter.py` compares source/runtime heads
 on fixed synthetic weights, query conditioning, decoder convolution/residual
 ordering with a substituted Attention sublayer, request anchor selection, and
