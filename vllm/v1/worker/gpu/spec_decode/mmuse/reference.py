@@ -124,7 +124,7 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
                 )
                 anchor = (
                     last_sampled[slot] if sampled[row] else next_prefill_tokens[0, slot]
-                )
+                ).reshape(())
             positions = (
                 context_positions[-1] + 1 + torch.arange(block, device=self.device)
             )

@@ -187,6 +187,7 @@ def reference_proposer():
 
     class Runtime:
         def rollout_correction(self, hidden, anchors, **kwargs):
+            assert anchors.shape == (hidden.shape[0],)
             return anchors[:, None] + torch.arange(1, 4), None
 
     proposer.model = Model()
@@ -194,7 +195,10 @@ def reference_proposer():
     return proposer
 
 
-def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering():
+@pytest.mark.parametrize("column_tokens", [False, True])
+def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering(
+    column_tokens,
+):
     proposer = reference_proposer()
     batch = SimpleNamespace(
         num_reqs=2,
@@ -212,7 +216,9 @@ def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering():
         aux_hidden_states=[torch.randn(4, 3)],
         num_sampled=torch.tensor([1, 0]),
         num_rejected=torch.tensor([0, 0]),
-        last_sampled=torch.tensor([8, 9]),
+        last_sampled=torch.tensor([[8], [9]])
+        if column_tokens
+        else torch.tensor([8, 9]),
         next_prefill_tokens=torch.tensor([[10, 11]]),
         temperature=torch.zeros(2),
         seeds=torch.zeros(2, dtype=torch.long),
