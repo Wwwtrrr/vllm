@@ -27,8 +27,12 @@ anchor+k+1. Sliding layers expose the same `[anchor-window, anchor)` context to
 every query slot. Synthetic query K/V is ephemeral. No draft attention objects
 or paged KV groups are registered, so the native Target cache layout is retained.
 
-Each Target TP rank executes a complete replicated draft. Target embedding and
-output-head matrices are gathered once and must be floating-point matrices.
+Each Target TP rank executes a complete replicated draft. Draft checkpoint
+embedding and output-head tensors are ignored even when serialized. Both IO
+matrices are supplied by the serving Target and gathered once under TP. They
+must be ordinary floating matrices and are converted to the draft's compute dtype.
+This ensures shared serving IO, but does not establish numerical equivalence
+with the original training teacher's IO or hidden states.
 Replication and context recomputation increase memory and compute costs: this
 is a correctness reference, not a throughput optimization. Target backbone
 quantization remains the backend's responsibility. Interface checks do not prove

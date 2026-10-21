@@ -145,10 +145,9 @@ class DeepseekMMuseReference(nn.Module):
             if name.startswith("verifier_") or name in ("t2d", "d2t"):
                 continue
             if name in ("embed_tokens.weight", "lm_head.weight"):
-                raise ValueError(
-                    "Reference MMuse requires full-vocabulary export "
-                    "with borrowed IO omitted"
-                )
+                # Full-vocabulary IO is always supplied by bind_target(), even
+                # when a training checkpoint also serialized its teacher's IO.
+                continue
             destination = (
                 name
                 if name.startswith(("layers.", "fc.", "norm.", "hidden_norm."))

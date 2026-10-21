@@ -328,3 +328,53 @@ def test_proposer_rejects_wrong_hc_width_rows_or_auxiliary_count(states):
             batch, {}, {}, None, states, None, None, None, None, None, None
         )
     assert proposer.model.history.requests == {}
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("embed_tokens.weight",),
+        ("lm_head.weight",),
+        ("embed_tokens.weight", "lm_head.weight"),
+    ],
+)
+def test_checkpoint_io_is_ignored_and_target_io_is_always_bound(names):
+    path = DIRECTORY.parent / "deepseek_mmuse_reference.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepseekMMuseReference"
+    )
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("load_weights", "bind_target")
+    ]
+    namespace = dict(torch=torch, get_tensor_model_parallel_world_size=lambda: 1)
+    exec(
+        compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace
+    )
+    owner = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=3, vocab_size=6),
+        feature_storage=torch.empty(1, 4, 3, dtype=torch.bfloat16),
+        named_parameters=lambda: [],
+    )
+    serialized = torch.arange(18).reshape(6, 3).float()
+    assert (
+        namespace["load_weights"](owner, [(name, serialized) for name in names])
+        == set()
+    )
+    target_weight = torch.full((6, 3), -1, dtype=torch.bfloat16)
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=target_weight)),
+        lm_head=SimpleNamespace(weight=target_weight),
+    )
+    namespace["bind_target"](owner, target)
+    for buffer in ("embedding_weight", "output_weight"):
+        torch.testing.assert_close(getattr(owner, buffer), target_weight)
+    # Loading another checkpoint must not replace IO already bound to Target.
+    namespace["load_weights"](owner, [(names[0], torch.zeros(5, 3))])
+    torch.testing.assert_close(owner.embedding_weight, target_weight)
+    torch.testing.assert_close(owner.output_weight, target_weight)
