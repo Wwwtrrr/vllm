@@ -84,15 +84,6 @@ def _add_global_draft_layer_exclusions(
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     """Resolve explicit causality before falling back to legacy layer defaults."""
-    if getattr(config, "speculators_model_type", None) == "mmuse":
-        # The training mask is causal only for sliding layers, unless the
-        # checkpoint explicitly enables non-causal sliding-window attention.
-        layer_types = getattr(config, "layer_types", None) or []
-        return (
-            bool(layer_types)
-            and layer_types[layer_idx] == _SLIDING_ATTENTION
-            and not getattr(config, "sliding_window_non_causal", False)
-        )
     is_causal = getattr(config, "is_causal", None)
     if is_causal is not None:
         return bool(is_causal)

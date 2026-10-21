@@ -9,12 +9,6 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.use_mmuse():
-        if vllm_config.model_config.hf_config.model_type == "deepseek_v4":
-            from vllm.v1.worker.gpu.spec_decode.mmuse.deepseek import (
-                DeepseekV4MMuseSpeculator,
-            )
-
-            return DeepseekV4MMuseSpeculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.mmuse.speculator import MMuseSpeculator
 
         return MMuseSpeculator(vllm_config, device)

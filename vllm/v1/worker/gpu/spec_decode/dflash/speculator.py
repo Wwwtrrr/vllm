@@ -373,19 +373,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if (
-            self.speculative_config.use_mmuse()
-            and getattr(
-                self.draft_model_config.hf_config, "target_hidden_state_format", None
-            )
-            == "deepseek_v4_mean_hc_head"
-            and not aux_hidden_states
-            and not dummy_run
-        ):
-            raise ValueError(
-                "DeepSeek-V4 MMuse requires the configured "
-                "mean-HC auxiliary hidden states"
-            )
         if aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
                 torch.cat(aux_hidden_states, dim=-1)

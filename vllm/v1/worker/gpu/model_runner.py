@@ -910,10 +910,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # target returns a persistent buffer sized at max_num_batched_tokens;
             # slice to the active token count that propose() expects.
             spec_hidden_states = hidden_states
-            if (
-                not self.speculative_config.use_mmuse()
-                and hasattr(self.model, "get_mtp_target_hidden_states")
-            ):
+            if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             if isinstance(self.sampler, GPUWatermarkSampler):
@@ -2193,10 +2190,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # target returns a persistent buffer sized at max_num_batched_tokens;
             # slice to the active token count that propose() expects.
             spec_hidden_states = draft_hidden_states
-            if (
-                not self.speculative_config.use_mmuse()
-                and hasattr(self.model, "get_mtp_target_hidden_states")
-            ):
+            if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
             if isinstance(self.sampler, GPUWatermarkSampler):

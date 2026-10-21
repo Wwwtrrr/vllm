@@ -359,13 +359,6 @@ class HFConfigParser(ConfigParserBase):
         )
         # Use custom model class if it's in our registry
         model_type = config_dict.get("model_type")
-        if config_dict.get("speculators_model_type") in (
-            "mmuse",
-            "dspark",
-        ) and isinstance(config_dict.get("transformer_layer_config"), dict):
-            # Some raw exports also carry the decoder's root model_type.
-            # Convert their explicit speculative schema before building a HF config.
-            model_type = "speculators"
         if model_type is None:
             model_type = (
                 "speculators"

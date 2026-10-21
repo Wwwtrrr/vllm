@@ -169,53 +169,11 @@ def update_mmuse(config_dict: dict, pre_trained_config: dict) -> None:
         if key not in metadata_fields:
             pre_trained_config[key] = value
     pre_trained_config["speculators_model_type"] = "mmuse"
-    pre_trained_config["architectures"] = [
-        "DeepseekV4MMuseSpeculator"
-        if config_dict.get("target_hidden_state_format") == "deepseek_v4_mean_hc_head"
-        else "MMuseSpeculator"
-    ]
+    pre_trained_config["architectures"] = ["MMuseSpeculator"]
     pre_trained_config["mmuse_source_config"] = source_config
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
     pre_trained_config["target_layer_ids"] = [i - 1 for i in aux_layer_ids]
-
-
-def is_deepseek_mmuse_export(config_dict: dict) -> bool:
-    """Identify a DSpark-labelled export migrated to MMuse by training.
-
-    The directory/architecture name alone cannot distinguish these weights from
-    baseline DSpark. Preserve baseline dispatch unless explicit features agree.
-    """
-    # Same explicit migration flags as training models/mmuse/compat.py. Markov
-    # and Confidence alone belong to baseline DSpark and do not trigger this.
-    enhanced = any(
-        config_dict.get(key, False)
-        for key in (
-            "dflash_context_residual",
-            "dflash_block_position_embedding",
-            "dflash_gated_layer_fusion",
-            "dflash2_dynamic_conv",
-            "dflash2_candidate_selector",
-            "enable_correction_head",
-            "correction_hidden_aux_loss",
-            "correction_hidden_feedback",
-            "correction_project_corrected_hidden",
-            "correction_with_markov",
-            "correction_lm_head_fusion",
-            "correction_rollout_metrics",
-            "correction_base_diagnostics",
-        )
-    ) or (
-        config_dict.get("selector_correction_feedback", "static") != "static"
-        or config_dict.get("correction_output_mode", "hidden") != "hidden"
-    )
-    return (
-        config_dict.get("speculators_model_type") == "dspark"
-        and config_dict.get("target_hidden_state_format") == "deepseek_v4_mean_hc_head"
-        and enhanced
-        and isinstance(config_dict.get("transformer_layer_config"), dict)
-        and config_dict["transformer_layer_config"].get("model_type") == "qwen3"
-    )
 
 
 @register_speculator("dspark")
@@ -241,11 +199,6 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
         False (anchor is a bonus token, only mask tokens predict, yielding
         block_size - 1 speculative tokens).
     """
-    if is_deepseek_mmuse_export(config_dict):
-        # Compatibility with the DSpark-labelled MMuse export. Keep the raw
-        # checkpoint metadata in mmuse_source_config; do not edit disk config.
-        update_mmuse(config_dict, pre_trained_config)
-        return
     architectures = config_dict.get("architectures") or []
     supported_architectures = {
         "Qwen3DSparkModel",
