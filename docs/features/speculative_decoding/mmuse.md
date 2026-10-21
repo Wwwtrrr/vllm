@@ -63,6 +63,37 @@ Correction rollout to the literal training offline evaluator, including long
 sliding contexts and mixed full/sliding layers. Native GPU/NPU loading, TP
 execution, acceptance and throughput still require server verification.
 
+### Temporary proposal and verification logs
+
+Enable bounded logs in the LLM engine's additional configuration (not in the
+speculative configuration):
+
+```python
+additional_config = {"mmuse_trace_steps": 4}
+# Pass additional_config=additional_config to LLM(...).
+```
+
+The default is zero (disabled); the maximum is 32. Existing additional-config
+options can be retained alongside this key. Search worker logs for
+`MMUSE_TRACE`. `proposal` records contain request IDs, persistent slots, anchor
+IDs, query/prediction positions and proposed token IDs. `verify` records contain
+the actual Target inputs and per-position comparisons with the recorded
+proposal. Request IDs and absolute positions are used even when batch order
+changes. A null `transport_matches` means a placeholder or no recorded proposal
+for that position, rather than a successful match. Prefill placeholders are
+explicitly marked.
+
+Target argmax is recorded after grammar constraints but before sampling
+penalties and filters. Its equality with a candidate is not the actual accepted
+count, especially for nonzero temperature. `result` contains the framework's
+sampled/rejected counts and scheduled draft counts. Acceptance stops at the
+first rejection; later argmax matches must not be counted as accepted tokens.
+
+GPU and Ascend LM-head TP sampling both invoke the trace. The logs add no model
+forward or TP collective, but enabled logging synchronizes devices and must not
+be used to benchmark throughput. Dummy/profile proposals are excluded. Restart
+with `mmuse_trace_steps=0` or omit the option to disable tracing.
+
 ## Qwen3 reference implementation
 
 This experimental adapter includes standalone MMuse inference components for

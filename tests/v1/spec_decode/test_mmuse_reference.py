@@ -196,12 +196,17 @@ def reference_proposer():
 
 
 @pytest.mark.parametrize("column_tokens", [False, True])
+@pytest.mark.parametrize("trace_enabled", [False, True])
 def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering(
     column_tokens,
+    trace_enabled,
 ):
     proposer = reference_proposer()
+    if trace_enabled:
+        proposer._mmuse_trace = module("trace").MMuseTrace(1)
     batch = SimpleNamespace(
         num_reqs=2,
+        num_draft_tokens=0,
         query_start_loc=torch.tensor([0, 2, 4]),
         positions=torch.tensor([0, 1, 0, 1]),
         idx_mapping_np=[1, 0],
@@ -233,6 +238,8 @@ def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering(
     )
     batch.query_start_loc = torch.tensor([0, 3, 6])
     batch.positions = torch.tensor([2, 3, 4, 2, 3, 4])
+    batch.num_draft_tokens = 6
+    batch.num_draft_tokens_per_req = torch.tensor([3, 3])
     common.update(
         aux_hidden_states=[torch.randn(6, 3)],
         num_rejected=torch.tensor([2, 1]),
@@ -246,6 +253,9 @@ def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering(
     saved = proposer.model.feature_storage.clone()
     proposer.propose(**common, dummy_run=True)
     torch.testing.assert_close(proposer.model.feature_storage, saved)
+    if trace_enabled:
+        assert proposer._mmuse_trace.proposals == 1
+        assert proposer._mmuse_trace.results == 1
 
 
 def test_draft_loader_isolates_target_quantizer_without_rebuilding_target_config(

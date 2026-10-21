@@ -5,6 +5,7 @@ import copy
 
 import torch
 
+from vllm.model_executor.models.mmuse.trace import MMuseTrace
 from vllm.model_executor.models.mmuse_runtime import validate_mmuse_config
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
@@ -14,6 +15,13 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
         validate_mmuse_config(vllm_config)
         super().__init__(vllm_config, device)
         self.num_query_per_req = self.num_speculative_steps
+        steps = (vllm_config.additional_config or {}).get("mmuse_trace_steps", 0)
+        trace = MMuseTrace(steps)
+        self._mmuse_trace = trace if steps else None
+
+    def trace_target(self, logits, input_batch):
+        if self._mmuse_trace is not None:
+            self._mmuse_trace.target(logits, input_batch)
 
     def load_draft_model(self, target_model, target_attn_layer_names):
         from vllm.model_executor.model_loader import get_model
@@ -77,6 +85,9 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
         if not count:
             return self.draft_tokens[:0]
         model = self.model
+        trace = getattr(self, "_mmuse_trace", None)
+        if trace is not None and not dummy_run:
+            trace.result(input_batch, num_sampled, num_rejected)
         if not dummy_run and not aux_hidden_states:
             raise ValueError(
                 "MMuse requires the trained mean-HC auxiliary feature list"
@@ -163,4 +174,8 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
             sample_token=sample_token if self.draft_logits is not None else None,
         )
         self.draft_tokens[:count].copy_(proposals)
+        if trace is not None and not dummy_run and trace.proposals < trace.limit:
+            trace.proposal(
+                input_batch, hidden, torch.stack(anchor_ids), positions, proposals
+            )
         return self.draft_tokens[:count]
