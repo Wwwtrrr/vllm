@@ -25,6 +25,13 @@ def validate_mmuse_config(config) -> None:
     # Required configuration and interfaces used by the Qwen3 adapter.
     if not source:
         raise ValueError("MMuse requires a Speculators-format MMuse checkpoint")
+    if config.model_config.hf_config.model_type == "deepseek_v4":
+        from vllm.model_executor.models.mmuse.deepseek_contract import (
+            validate_deepseek_export,
+        )
+
+        validate_deepseek_export(config, source)
+        return
     if config.model_config.hf_config.model_type != "qwen3":
         raise ValueError("MMuse reference adapter requires a Qwen3 target")
     if source["transformer_layer_config"].get("model_type") != "qwen3":

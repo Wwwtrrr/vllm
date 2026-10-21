@@ -650,6 +650,7 @@ _SPECULATIVE_DECODING_MODELS = {
     ),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "MMuseSpeculator": ("qwen3_mmuse", "MMuseQwen3ForCausalLM"),
+    "DeepseekMMuseReference": ("deepseek_mmuse_reference", "DeepseekMMuseReference"),
     "MMuseDraftModel": ("qwen3_mmuse", "MMuseQwen3ForCausalLM"),
     "Qwen3OmniDSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "K3DSparkModel": (

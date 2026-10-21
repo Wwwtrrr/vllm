@@ -1,4 +1,65 @@
-# MMuse reference adapter for Qwen3
+# MMuse reference adapters
+
+## DeepSeek-V4: stateless reference implementation
+
+For `method="mmuse"` and a `deepseek_v4` target, the V2 worker selects
+`MMuseReferenceSpeculator`; Ascend selects `AscendMMuseReferenceSpeculator`.
+Qwen3 targets retain the existing implementation described below.
+
+This adapter follows the training checkout's `speculators_dsv4/training.py`,
+`contract.py`, `models/mmuse/compat.py` and
+`DSparkOfflineRunner._single_anchor_backbone`. DeepSeek is the teacher; the
+trained dense decoder is Qwen3. Auxiliary IDs are one-based post-layer mean-HC
+slots and exclude the final teacher HC-head slot.
+
+`DeepseekMMuseReference` uses unpacked linear projections, the exported
+`head_dim`, RMSNorm, default RoPE, grouped-query SDPA, dynamic convolution and
+trained residual order. Fusion, Selector, Markov and Correction use the existing
+inference-only MMuse modules; serving does not import the training package.
+Missing, unexpected and incorrectly shaped trained tensors fail loading.
+Legacy enhanced DSpark exports follow the training migration flags; baseline
+DSpark retains its own loader.
+
+The proposer retains only confirmed projected target features, indexed by
+persistent request slot and request ID. Rejected suffixes are excluded. Query
+blocks are `[anchor, mask, ...]` at absolute positions; slot k predicts
+anchor+k+1. Sliding layers expose the same `[anchor-window, anchor)` context to
+every query slot. Synthetic query K/V is ephemeral. No draft attention objects
+or paged KV groups are registered, so the native Target cache layout is retained.
+
+Each Target TP rank executes a complete replicated draft. Target embedding and
+output-head matrices are gathered once and must be floating-point matrices.
+Replication and context recomputation increase memory and compute costs: this
+is a correctness reference, not a throughput optimization. Target backbone
+quantization remains the backend's responsibility. Interface checks do not prove
+that the serving Target weights match the training teacher numerically.
+
+Require BF16 activations, an unquantized draft, eager Target and Draft,
+`enable_prefix_caching=False`, and PP/DP/context parallel sizes of one. Target TP
+may exceed one; Draft computation is replicated. Adaptive verification,
+watermarking and local argmax reduction are rejected. FULL graphs are not
+implemented for this path.
+
+Retain the working Target quantization/tokenizer settings and set:
+
+```python
+enforce_eager = True
+enable_prefix_caching = False
+speculative_config = {
+    "method": "mmuse",
+    "model": "/home/data/DeepSeek-V4-Flash-mmuse",
+    "num_speculative_tokens": 7,  # Must equal this export's block_size.
+    "enforce_eager": True,
+    "draft_sample_method": "greedy",
+}
+```
+
+CPU tests compare synthetic checkpoint weights, the complete decoder and
+Correction rollout to the literal training offline evaluator, including long
+sliding contexts and mixed full/sliding layers. Native GPU/NPU loading, TP
+execution, acceptance and throughput still require server verification.
+
+## Qwen3 reference implementation
 
 This experimental adapter includes standalone MMuse inference components for
 Model Runner V2. It has not been validated with a trained
