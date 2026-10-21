@@ -63,46 +63,6 @@ Correction rollout to the literal training offline evaluator, including long
 sliding contexts and mixed full/sliding layers. Native GPU/NPU loading, TP
 execution, acceptance and throughput still require server verification.
 
-### Diagnosing zero acceptance
-
-`examples/offline_inference/mmuse_deepseek_audit.py` runs two short requests at
-temperature zero with four audited proposal steps. Use the Target TP,
-quantization and tokenizer settings that already work on your server:
-
-```bash
-export VLLM_USE_V2_MODEL_RUNNER=1
-python examples/offline_inference/mmuse_deepseek_audit.py \
-  --target /home/data/DeepSeek-V4-Flash-DSpark-w4a8-test \
-  --draft /home/data/DeepSeek-V4-Flash-mmuse \
-  --tp 4 --quantization ascend --tokenizer-mode deepseek_v4 \
-  --output ./mmuse-audit
-```
-
-The TP value above is an example; retain your working deployment's TP. The
-script needs local checkpoint directories. Add `--teacher /path/to/original`
-to compare original training IO as well, or use `--io-only` for CPU checkpoint
-comparison without creating the inference engine. It compares complete IO
-matrices in row chunks after BF16 conversion, reporting exact inequality counts,
-max/mean absolute differences and nonfinite values. Missing Draft IO is an
-ordinary omitted-export case, not a mismatch.
-
-`io-comparison.json` reports checkpoint IO comparisons. Per-worker JSONL files
-report configured/captured auxiliary layers, sampled feature statistics, actual
-anchor/mask inputs and positions, proposals, verification candidates and actual
-sampling/rejection counts. `transport_matches=false` means an observed candidate
-differs from the previously recorded proposal at that absolute position.
-`transport_matches=null` means no recorded proposal covers that position.
-Negative placeholder candidates are excluded. `target_raw_argmax` and
-`target_raw_probability` refer to logits before sampling filters; `raw_match`
-is not a substitute for the framework's accepted-token metric. A match after an
-earlier rejection is not itself an accepted token.
-
-Callbacks are installed only by this opt-in RPC, execute no additional TP
-collectives and restore themselves after the configured steps. They synchronize
-devices and are unsuitable for throughput measurement. These tools have CPU
-coverage; actual GPU/NPU RPC execution still needs server validation. Checkpoint
-IO agreement does not establish intermediate feature agreement.
-
 ## Qwen3 reference implementation
 
 This experimental adapter includes standalone MMuse inference components for
