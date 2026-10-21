@@ -274,7 +274,11 @@ def test_draft_loader_isolates_target_quantizer_without_rebuilding_target_config
 
     def get_model(**kwargs):
         seen.update(kwargs)
-        return SimpleNamespace(bind_target=lambda value: seen.update(target=value))
+        return SimpleNamespace(
+            bind_target=lambda value, rotation: seen.update(
+                target=value, rotation=rotation
+            )
+        )
 
     loader.get_model = get_model
     monkeypatch.setitem(sys.modules, loader.__name__, loader)
@@ -284,6 +288,7 @@ def test_draft_loader_isolates_target_quantizer_without_rebuilding_target_config
     assert seen["vllm_config"].load_config == "draft"
     assert seen["model_config"] is proposer.draft_model_config
     assert seen["target"] is target
+    assert seen["rotation"] is None
     assert proposer.vllm_config.quant_config is target_quantizer
     assert proposer.vllm_config.load_config == "target"
 
@@ -354,7 +359,7 @@ def test_proposer_rejects_wrong_hc_width_rows_or_auxiliary_count(states):
         ("embed_tokens.weight", "lm_head.weight"),
     ],
 )
-def test_checkpoint_io_is_ignored_and_target_io_is_always_bound(names):
+def test_unrotated_target_binding_keeps_legacy_io_policy(names):
     path = DIRECTORY.parent / "deepseek_mmuse_reference.py"
     tree = ast.parse(path.read_text())
     cls = next(
@@ -390,7 +395,65 @@ def test_checkpoint_io_is_ignored_and_target_io_is_always_bound(names):
     namespace["bind_target"](owner, target)
     for buffer in ("embedding_weight", "output_weight"):
         torch.testing.assert_close(getattr(owner, buffer), target_weight)
-    # Loading another checkpoint must not replace IO already bound to Target.
-    namespace["load_weights"](owner, [(names[0], torch.zeros(5, 3))])
+    # A malformed teacher matrix must not silently enter a rotated model.
+    with pytest.raises(ValueError, match="teacher IO"):
+        namespace["load_weights"](owner, [(names[0], torch.zeros(5, 3))])
     torch.testing.assert_close(owner.embedding_weight, target_weight)
     torch.testing.assert_close(owner.output_weight, target_weight)
+
+
+def test_quarot_uses_teacher_io_and_unrotates_each_layer_before_fusion():
+    path = DIRECTORY.parent / "deepseek_mmuse_reference.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepseekMMuseReference"
+    )
+    methods = [
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("load_weights", "bind_target", "project_features")
+    ]
+    namespace = dict(torch=torch)
+    exec(
+        compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace
+    )
+    torch.manual_seed(93)
+    rotation = torch.linalg.qr(torch.randn(4, 4)).Q
+    teacher_embedding, teacher_head = torch.randn(6, 4), torch.randn(6, 4)
+    owner = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=4, vocab_size=6),
+        feature_storage=torch.empty(1, 3, 4),
+        named_parameters=lambda: [],
+    )
+    namespace["load_weights"](
+        owner,
+        [
+            ("embed_tokens.weight", teacher_embedding),
+            ("lm_head.weight", teacher_head),
+        ],
+    )
+    # No target access or TP gather is permitted: its head has fused norm.
+    namespace["bind_target"](owner, object(), rotation=rotation)
+    torch.testing.assert_close(owner.embedding_weight, teacher_embedding)
+    torch.testing.assert_close(owner.output_weight, teacher_head)
+    raw = torch.randn(3, 2, 4)
+    seen = []
+    owner.runtime = SimpleNamespace(
+        _prepare_target_hidden=lambda x: (seen.append(x.clone()) or x, None)
+    )
+    namespace["project_features"](owner, (raw @ rotation).reshape(3, 8))
+    torch.testing.assert_close(seen[0], raw.reshape(3, 8))
+    # The recovered teacher head reproduces teacher logits, unlike the fused
+    # deployed head, even after its inverse rotation.
+    norm = torch.tensor([0.2, 0.4, 0.6, 0.8])
+    deployed_head = (teacher_head * norm) @ rotation
+    hidden = torch.randn(2, 4)
+    expected = hidden @ teacher_head.T
+    torch.testing.assert_close(hidden @ owner.output_weight.T, expected)
+    assert not torch.allclose(hidden @ (deployed_head @ rotation.T).T, expected)
+    owner.checkpoint_head = None
+    with pytest.raises(ValueError, match="original training teacher"):
+        namespace["bind_target"](owner, object(), rotation=rotation)

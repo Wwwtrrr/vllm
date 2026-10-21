@@ -35,8 +35,11 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
         model = get_model(
             vllm_config=draft_context, model_config=self.draft_model_config
         )
-        model.bind_target(target_model)
+        model.bind_target(target_model, rotation=self.get_target_rotation())
         return model
+
+    def get_target_rotation(self):
+        return None
 
     def set_attn(
         self,

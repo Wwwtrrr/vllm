@@ -73,6 +73,9 @@ class DeepseekMMuseReference(nn.Module):
         self.runtime.lm_head = BorrowedIO(self, head=True)
         self.register_buffer("embedding_weight", None, persistent=False)
         self.register_buffer("output_weight", None, persistent=False)
+        self.register_buffer("checkpoint_embedding", None, persistent=False)
+        self.register_buffer("checkpoint_head", None, persistent=False)
+        self.register_buffer("target_rotation", None, persistent=False)
         self.window = (
             self.config.sliding_window
             if all(kind == "sliding_attention" for kind in types)
@@ -91,7 +94,26 @@ class DeepseekMMuseReference(nn.Module):
         )
         self.history = VerifiedPrefix(capacity, self.feature_storage)
 
-    def bind_target(self, target):
+    def bind_target(self, target, rotation=None):
+        if rotation is not None:
+            h = self.config.hidden_size
+            if rotation.shape != (h, h) or not torch.isfinite(rotation).all():
+                raise ValueError("MMuse requires a finite hidden-size QuaRot matrix")
+            embedding = getattr(self, "checkpoint_embedding", None)
+            head = getattr(self, "checkpoint_head", None)
+            if embedding is None or head is None:
+                raise ValueError(
+                    "QuaRot MMuse requires embed_tokens.weight and lm_head.weight "
+                    "from the original training teacher in the draft checkpoint. "
+                    "The deployed Target head has fused normalization and cannot "
+                    "be borrowed or recovered by inverse rotation alone."
+                )
+            self.target_rotation = rotation.to(
+                device=self.feature_storage.device, dtype=torch.float32
+            ).contiguous()
+            self.embedding_weight = embedding
+            self.output_weight = head
+            return
         if hasattr(target, "get_language_model"):
             target = target.get_language_model()
         tp = get_tensor_model_parallel_world_size()
@@ -121,6 +143,19 @@ class DeepseekMMuseReference(nn.Module):
             )
 
     def project_features(self, features):
+        rotation = getattr(self, "target_rotation", None)
+        if rotation is not None:
+            # Undo each layer's residual-stream rotation BEFORE learned norms
+            # and gated layer fusion; rotating only fc would miss those paths.
+            shape = features.shape
+            features = (
+                (
+                    features.reshape(*shape[:-1], -1, self.config.hidden_size).float()
+                    @ rotation.T
+                )
+                .to(features.dtype)
+                .reshape(shape)
+            )
         return self.runtime._prepare_target_hidden(features)[0]
 
     def forward(self, input_ids, positions, context_positions, projected_context):
@@ -145,8 +180,26 @@ class DeepseekMMuseReference(nn.Module):
             if name.startswith("verifier_") or name in ("t2d", "d2t"):
                 continue
             if name in ("embed_tokens.weight", "lm_head.weight"):
-                # Full-vocabulary IO is always supplied by bind_target(), even
-                # when a training checkpoint also serialized its teacher's IO.
+                if value.shape != (
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                ) or value.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+                    raise ValueError(f"Invalid MMuse teacher IO: {name}")
+                buffer = (
+                    "checkpoint_embedding"
+                    if name == "embed_tokens.weight"
+                    else "checkpoint_head"
+                )
+                setattr(
+                    self,
+                    buffer,
+                    value.detach()
+                    .to(
+                        device=self.feature_storage.device,
+                        dtype=self.feature_storage.dtype,
+                    )
+                    .clone(),
+                )
                 continue
             destination = (
                 name

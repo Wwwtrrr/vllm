@@ -27,12 +27,20 @@ anchor+k+1. Sliding layers expose the same `[anchor-window, anchor)` context to
 every query slot. Synthetic query K/V is ephemeral. No draft attention objects
 or paged KV groups are registered, so the native Target cache layout is retained.
 
-Each Target TP rank executes a complete replicated draft. Draft checkpoint
-embedding and output-head tensors are ignored even when serialized. Both IO
+Each Target TP rank executes a complete replicated draft. Without QuaRot, IO
 matrices are supplied by the serving Target and gathered once under TP. They
 must be ordinary floating matrices and are converted to the draft's compute dtype.
-This ensures shared serving IO, but does not establish numerical equivalence
-with the original training teacher's IO or hidden states.
+For an Ascend Target declaring a QuaRot global rotation, each auxiliary layer
+is inverse-rotated in FP32 before any trained normalization or gated fusion.
+The draft must contain the original teacher's `embed_tokens.weight` and
+`lm_head.weight`; these are retained for draft IO. A deployed head may already
+contain the teacher's final norm and cannot be restored by inverse rotation
+alone. Missing teacher IO or a declared but unavailable rotation matrix causes
+a loading error instead of silently borrowing incompatible Target IO.
+The declared rotation path is tried first, then `optional/<filename>` inside
+the Target directory for exports with a stale `../optional/` relative path.
+These interface checks do not establish numerical parity with the training
+teacher; verify acceptance and feature parity on the real checkpoint.
 Replication and context recomputation increase memory and compute costs: this
 is a correctness reference, not a throughput optimization. Target backbone
 quantization remains the backend's responsibility. Interface checks do not prove
