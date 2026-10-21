@@ -88,6 +88,53 @@ Do not edit a checkpoint's feature switches to bypass missing-weight errors.
 
 ## Validation still required
 
+### Diagnose zero acceptance with real checkpoints
+
+The eager smoke script accepts `--diagnostic-dir /path/to/new/empty-directory`
+and `--diagnostic-steps 3`. Use the target TP and quantization settings that
+already work on the server. The directory must be new/empty for each run.
+Example for an Ascend TP4 deployment:
+
+```bash
+export VLLM_USE_V2_MODEL_RUNNER=1
+python examples/offline_inference/mmuse_deepseek_smoke.py \
+  --target /home/data/DeepSeek-V4-Flash-DSpark-w4a8-test \
+  --draft /home/data/DeepSeek-V4-Flash-mmuse \
+  --tp 4 --quantization ascend --tokenizer-mode deepseek_v4 \
+  --max-tokens 32 --diagnostic-dir /tmp/mmuse-diagnostics-run1
+```
+
+Before generation, a worker RPC compares checkpoint safetensors against loaded
+parameters, accounting for Q/K/V and gate/up fusion, row/column TP partitions,
+and replicated KV heads. If embedding/head tensors are serialized, those are
+compared against the borrowed IO too. The audit fails on numeric disagreement;
+backend-specific transformed layouts may also require investigation. It tests
+the live target embedding and output-head functions against the draft's borrowed
+ones. Skipped verifier-only parameters and omitted IO tensors cannot establish
+identity with the BF16 training target.
+
+Each worker writes bounded events to `rank-N.jsonl`:
+
+- `checkpoint_audit`: checked tensor count and mismatches.
+- `borrowed_io_probe`: actual embedding/head error and head argmax equality.
+- `features` / `layer` / `proposal`: shapes, RMS/finite checks, anchors and tokens.
+- `verification`: actual draft input IDs versus processed target-logit argmax,
+  absolute positions, invalid placeholders, target probability of the draft,
+  and whether the verifier received the previous proposal unchanged.
+
+`draft_ids_match_previous_proposal=false` points to token transport/scheduling;
+it does not by itself identify the faulty component. Matching IDs but zero
+`greedy_matched_prefix` point to a genuine first-token prediction mismatch.
+This diagnostic uses greedy target sampling and records the rejection method,
+so synthetic acceptance and probabilistic-cache settings remain visible.
+Nonfinite processed logits may include intentional negative infinity from
+sampling constraints; inspect actual NaNs separately before inferring overflow.
+
+Callbacks are installed only in the diagnostic process after model loading and
+do not alter the default serving path. They synchronize devices, reread weights,
+and record token IDs. Use them for diagnosis, not throughput measurement. The
+tool has CPU tests; its actual CUDA/NPU RPC execution still needs server validation.
+
 ### DeepSeek-V4 dense MMuse candidate adapter
 
 `DeepseekV4MMuseSpeculator` is a separate model entry for the dense drafter
@@ -103,8 +150,10 @@ The export must contain `speculators_model_type="mmuse"`,
 checkpoint is not converted by changing its model name. Raw MMuse exports are
 recognized even when their root `model_type` names the dense decoder.
 The DSpark-labelled export (`DSparkDraftModel`, `speculators_model_type="dspark"`)
-is also recognized when the DeepSeek mean-HC format, Qwen3 decoder, Correction,
-dynamic convolution and candidate Selector are explicitly present and enabled.
+is also recognized when the DeepSeek mean-HC format, Qwen3 decoder and explicit
+MMuse extension flags match training's `models/mmuse/compat.py` migration rule.
+Markov and Confidence alone do not trigger this migration. The independent
+serving path currently requires a trained Correction head.
 Its original metadata is preserved; the in-memory runtime identity becomes
 MMuse. Baseline DSpark exports keep their existing loader. The actual tensors
 must still pass the strict MMuse trained-weight loading checks.
@@ -119,13 +168,20 @@ to one. The runtime proposal length must equal the checkpoint's `block_size`.
 Ascend's cache planner retains both native DeepSeek cache groups and dense draft
 cache groups in the native shared backing allocation.
 
-For a DeepSeek MMuse draft with sliding-attention layers, real eager proposals
-use explicit anchor-relative SDPA attention. Training exposes the same context
+DeepSeek dispatch uses `DeepseekV4MMuseSpeculator(DraftModelSpeculator)` in vLLM
+and `AscendDeepseekV4MMuseSpeculator` in Ascend's V2 runner. This independent
+proposer owns input preparation, verified feature history, forward and Correction
+sampling; it does not call `DFlashSpeculator.propose`. Generic model loading,
+TP projections and target verification remain framework services. Qwen3 targets
+keep the existing MMuse proposer described above.
+
+DeepSeek eager proposals use explicit anchor-relative SDPA attention. Training exposes the same context
 interval `[anchor-window, anchor)` to every slot, while ordinary paged SWA moves
 the interval with each query. The eager path retains verified target features
 per persistent request slot and ID, excludes rejected rows, and recomputes the
 dense draft K/V from that history. It does not read the paged draft SWA cache.
-Native draft attention remains in dummy/profile runs. This path requires
+Dummy/profile runs now exercise the same anchor-block forward and Correction
+implementation without adding fake history to real requests. This path requires
 `enable_prefix_caching=False`, since reused target prefix KV does not supply
 the intermediate features needed to reconstruct draft context.
 

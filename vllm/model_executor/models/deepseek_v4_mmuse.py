@@ -62,8 +62,11 @@ class DeepseekV4MMuseForCausalLM(nn.Module):
         self.runtime.lm_head = _TargetHead(self)
         self.model._runtime_ref = weakref.ref(self.runtime)
         self._target_weights_bound = False
-        layer_types = getattr(self.config, "layer_types", None) or []
-        if "sliding_attention" in layer_types:
+        layer_types = (
+            getattr(self.config, "layer_types", None)
+            or ["full_attention"] * self.config.num_hidden_layers
+        )
+        if layer_types:
             from vllm.model_executor.models.mmuse.anchor_attention import (
                 AnchorContextCache,
             )

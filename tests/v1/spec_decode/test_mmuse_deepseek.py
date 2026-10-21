@@ -263,8 +263,8 @@ def test_dspark_labelled_export_preserves_baseline_or_selects_mmuse(mmuse_heads)
         speculators_model_type="dspark",
         architectures=["DSparkDraftModel"],
         enable_correction_head=mmuse_heads,
-        dflash2_dynamic_conv=True,
-        dflash2_candidate_selector=True,
+        dflash2_dynamic_conv=mmuse_heads,
+        dflash2_candidate_selector=mmuse_heads,
     )
     converted = dict(source["transformer_layer_config"])
     algos.update_dspark(source, converted)

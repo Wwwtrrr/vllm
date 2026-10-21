@@ -116,9 +116,7 @@ def validate_mmuse_deepseek_v4_config(config, source) -> None:
             "DeepSeek-V4 MMuse requires BF16 activations, "
             "independently of target weight quantization"
         )
-    if "sliding_attention" in (getattr(hf, "layer_types", None) or []) and getattr(
-        getattr(config, "cache_config", None), "enable_prefix_caching", False
-    ):
+    if getattr(getattr(config, "cache_config", None), "enable_prefix_caching", False):
         raise ValueError(
             "DeepSeek-V4 MMuse anchor attention requires enable_prefix_caching=False "
             "to retain verified target features for every request"
