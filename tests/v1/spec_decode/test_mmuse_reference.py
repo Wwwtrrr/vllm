@@ -271,7 +271,7 @@ def test_reference_decoder_registers_no_paged_attention():
 
 
 def test_target_dispatch_keeps_deepseek_tp_and_sliding_attention_support(monkeypatch):
-    path = DIRECTORY.parent / "mmuse_runtime.py"
+    path = DIRECTORY / "validation.py"
     tree = ast.parse(path.read_text())
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
     namespace = dict(torch=torch, nn=torch.nn)
@@ -332,6 +332,18 @@ def test_target_dispatch_keeps_deepseek_tp_and_sliding_attention_support(monkeyp
     config.speculative_config.draft_model_config.hf_config.mmuse_source_config = None
     with pytest.raises(ValueError, match="Speculators-format"):
         namespace["validate_mmuse_config"](config)
+
+
+def reference_io_helpers(namespace):
+    path = DIRECTORY.parent / "deepseek_mmuse_reference.py"
+    tree = ast.parse(path.read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    namespace.setdefault("torch", torch)
+    namespace.setdefault("get_tensor_model_parallel_world_size", lambda: 1)
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
 
 
 def reference_proposer():
@@ -434,14 +446,10 @@ def test_probabilistic_reference_proposer_caches_final_logits_by_slot_and_positi
 
 
 @pytest.mark.parametrize("column_tokens", [False, True])
-@pytest.mark.parametrize("trace_enabled", [False, True])
 def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering(
     column_tokens,
-    trace_enabled,
 ):
     proposer = reference_proposer()
-    if trace_enabled:
-        proposer._mmuse_trace = module("trace").MMuseTrace(1)
     batch = SimpleNamespace(
         num_reqs=2,
         num_draft_tokens=0,
@@ -491,9 +499,6 @@ def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering(
     saved = proposer.model.feature_storage.clone()
     proposer.propose(**common, dummy_run=True)
     torch.testing.assert_close(proposer.model.feature_storage, saved)
-    if trace_enabled:
-        assert proposer._mmuse_trace.proposals == 1
-        assert proposer._mmuse_trace.results == 1
 
 
 def test_draft_loader_isolates_target_quantizer_without_rebuilding_target_config(
@@ -552,6 +557,7 @@ def test_borrowed_io_gathers_float_shards_and_matches_draft_dtype(dtype):
             (weight, weight + 10), dim
         ),
     )
+    reference_io_helpers(namespace)
     exec(
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
         namespace,
@@ -612,6 +618,7 @@ def test_unrotated_target_binding_keeps_legacy_io_policy(names):
         and node.name in ("load_weights", "bind_target")
     ]
     namespace = dict(torch=torch, get_tensor_model_parallel_world_size=lambda: 1)
+    reference_io_helpers(namespace)
     exec(
         compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace
     )
@@ -655,6 +662,7 @@ def test_quarot_uses_teacher_io_and_unrotates_each_layer_before_fusion():
         and node.name in ("load_weights", "bind_target", "project_features")
     ]
     namespace = dict(torch=torch)
+    reference_io_helpers(namespace)
     exec(
         compile(ast.Module(body=methods, type_ignores=[]), str(path), "exec"), namespace
     )
@@ -717,6 +725,7 @@ def test_checkpoint_scalar_gate_layout_preserves_value(
         if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
     )
     namespace = dict(torch=torch)
+    reference_io_helpers(namespace)
     exec(
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
         namespace,

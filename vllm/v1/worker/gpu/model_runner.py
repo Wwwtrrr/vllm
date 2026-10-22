@@ -1592,10 +1592,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
-        trace_target = getattr(self.speculator, "trace_target", None)
-        if trace_target is not None:
-            trace_target(logits, input_batch)
-
         sampler_output: SamplerOutput | None
         if input_batch.num_reqs == 0:
             # This rank owns no requests this step. It contributes an

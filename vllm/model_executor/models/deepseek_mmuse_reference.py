@@ -21,6 +21,75 @@ from vllm.model_executor.models.mmuse.runtime import MMuseRuntime
 from vllm.model_executor.models.mmuse_runtime import validate_mmuse_config
 
 
+def _bind_teacher_io(model, rotation):
+    h = model.config.hidden_size
+    if rotation.shape != (h, h) or not torch.isfinite(rotation).all():
+        raise ValueError("MMuse requires a finite hidden-size QuaRot matrix")
+    embedding = getattr(model, "checkpoint_embedding", None)
+    head = getattr(model, "checkpoint_head", None)
+    if embedding is None or head is None:
+        raise ValueError(
+            "QuaRot MMuse requires embed_tokens.weight and lm_head.weight "
+            "from the original training teacher in the draft checkpoint. "
+            "The deployed Target head has fused normalization and cannot "
+            "be borrowed or recovered by inverse rotation alone."
+        )
+    model.target_rotation = rotation.to(
+        device=model.feature_storage.device, dtype=torch.float32
+    ).contiguous()
+    model.embedding_weight = embedding
+    model.output_weight = head
+
+
+def _bind_deployed_io(model, target):
+    if hasattr(target, "get_language_model"):
+        target = target.get_language_model()
+    tp = get_tensor_model_parallel_world_size()
+    for name, module in (
+        ("embedding_weight", target.model.embed_tokens),
+        ("output_weight", target.lm_head),
+    ):
+        weight = module.weight.detach()
+        if (
+            weight.ndim != 2
+            or weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+            or weight.shape[1] != model.config.hidden_size
+        ):
+            raise ValueError("MMuse borrowed IO must be ordinary floating matrices")
+        if tp > 1:
+            weight = tensor_model_parallel_all_gather(weight, dim=0)
+        if weight.shape[0] < model.config.vocab_size:
+            raise ValueError("MMuse borrowed IO does not cover the target vocabulary")
+        setattr(
+            model,
+            name,
+            weight[: model.config.vocab_size]
+            .to(dtype=model.feature_storage.dtype)
+            .contiguous(),
+        )
+
+
+def _load_teacher_io(model, name, value):
+    if value.shape != (
+        model.config.vocab_size,
+        model.config.hidden_size,
+    ) or value.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"Invalid MMuse teacher IO: {name}")
+    buffer = (
+        "checkpoint_embedding" if name == "embed_tokens.weight" else "checkpoint_head"
+    )
+    setattr(
+        model,
+        buffer,
+        value.detach()
+        .to(
+            device=model.feature_storage.device,
+            dtype=model.feature_storage.dtype,
+        )
+        .clone(),
+    )
+
+
 class BorrowedIO(nn.Module):
     def __init__(self, owner, head=False):
         super().__init__()
@@ -123,52 +192,11 @@ class DeepseekMMuseReference(nn.Module):
         )
 
     def bind_target(self, target, rotation=None):
+        """Use serialized teacher IO for QuaRot, deployed IO otherwise."""
         if rotation is not None:
-            h = self.config.hidden_size
-            if rotation.shape != (h, h) or not torch.isfinite(rotation).all():
-                raise ValueError("MMuse requires a finite hidden-size QuaRot matrix")
-            embedding = getattr(self, "checkpoint_embedding", None)
-            head = getattr(self, "checkpoint_head", None)
-            if embedding is None or head is None:
-                raise ValueError(
-                    "QuaRot MMuse requires embed_tokens.weight and lm_head.weight "
-                    "from the original training teacher in the draft checkpoint. "
-                    "The deployed Target head has fused normalization and cannot "
-                    "be borrowed or recovered by inverse rotation alone."
-                )
-            self.target_rotation = rotation.to(
-                device=self.feature_storage.device, dtype=torch.float32
-            ).contiguous()
-            self.embedding_weight = embedding
-            self.output_weight = head
-            return
-        if hasattr(target, "get_language_model"):
-            target = target.get_language_model()
-        tp = get_tensor_model_parallel_world_size()
-        for name, module in (
-            ("embedding_weight", target.model.embed_tokens),
-            ("output_weight", target.lm_head),
-        ):
-            weight = module.weight.detach()
-            if (
-                weight.ndim != 2
-                or weight.dtype not in (torch.bfloat16, torch.float16, torch.float32)
-                or weight.shape[1] != self.config.hidden_size
-            ):
-                raise ValueError("MMuse borrowed IO must be ordinary floating matrices")
-            if tp > 1:
-                weight = tensor_model_parallel_all_gather(weight, dim=0)
-            if weight.shape[0] < self.config.vocab_size:
-                raise ValueError(
-                    "MMuse borrowed IO does not cover the target vocabulary"
-                )
-            setattr(
-                self,
-                name,
-                weight[: self.config.vocab_size]
-                .to(dtype=self.feature_storage.dtype)
-                .contiguous(),
-            )
+            _bind_teacher_io(self, rotation)
+        else:
+            _bind_deployed_io(self, target)
 
     def project_features(self, features):
         rotation = getattr(self, "target_rotation", None)
@@ -246,26 +274,7 @@ class DeepseekMMuseReference(nn.Module):
             if name.startswith("verifier_") or name in ("t2d", "d2t"):
                 continue
             if name in ("embed_tokens.weight", "lm_head.weight"):
-                if value.shape != (
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                ) or value.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-                    raise ValueError(f"Invalid MMuse teacher IO: {name}")
-                buffer = (
-                    "checkpoint_embedding"
-                    if name == "embed_tokens.weight"
-                    else "checkpoint_head"
-                )
-                setattr(
-                    self,
-                    buffer,
-                    value.detach()
-                    .to(
-                        device=self.feature_storage.device,
-                        dtype=self.feature_storage.dtype,
-                    )
-                    .clone(),
-                )
+                _load_teacher_io(self, name, value)
                 continue
             destination = (
                 name

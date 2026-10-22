@@ -5,7 +5,6 @@ import copy
 
 import torch
 
-from vllm.model_executor.models.mmuse.trace import MMuseTrace
 from vllm.model_executor.models.mmuse_runtime import validate_mmuse_config
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
@@ -15,13 +14,6 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
         validate_mmuse_config(vllm_config)
         super().__init__(vllm_config, device)
         self.num_query_per_req = self.num_speculative_steps
-        steps = (vllm_config.additional_config or {}).get("mmuse_trace_steps", 0)
-        trace = MMuseTrace(steps)
-        self._mmuse_trace = trace if steps else None
-
-    def trace_target(self, logits, input_batch):
-        if self._mmuse_trace is not None:
-            self._mmuse_trace.target(logits, input_batch)
 
     def load_draft_model(self, target_model, target_attn_layer_names):
         from vllm.model_executor.model_loader import get_model
@@ -64,6 +56,42 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
 
         return gumbel_sample(*args, **kwargs)
 
+    def _project_target_features(self, input_batch, aux_hidden_states, dummy_run):
+        model = self.model
+        if not dummy_run and not aux_hidden_states:
+            raise ValueError(
+                "MMuse requires the trained mean-HC auxiliary feature list"
+            )
+        if not dummy_run:
+            expected = model.config.mmuse_source_config["aux_hidden_state_layer_ids"]
+            if len(aux_hidden_states) != len(expected) or any(
+                state.ndim != 2
+                or state.shape[0] != input_batch.positions.shape[0]
+                or state.shape[1] != self.hidden_size
+                for state in aux_hidden_states
+            ):
+                raise ValueError(
+                    "MMuse auxiliary tensors do not match "
+                    "trained layers and target rows"
+                )
+        return (
+            model.project_features(torch.cat(aux_hidden_states, -1))
+            if aux_hidden_states
+            else None
+        )
+
+    def _build_query(self, context_positions, anchor):
+        model, block = self.model, self.num_query_per_req
+        positions = context_positions[-1] + 1 + torch.arange(block, device=self.device)
+        ids = torch.full(
+            (block,),
+            model.config.mask_token_id,
+            device=self.device,
+            dtype=torch.long,
+        )
+        ids[0] = anchor
+        return ids, positions
+
     @torch.inference_mode()
     def propose(
         self,
@@ -84,33 +112,12 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
         mm_inputs=None,
         is_profile=False,
     ):
-        count, block = input_batch.num_reqs, self.num_query_per_req
+        count = input_batch.num_reqs
         if not count:
             return self.draft_tokens[:0]
         model = self.model
-        trace = getattr(self, "_mmuse_trace", None)
-        if trace is not None and not dummy_run:
-            trace.result(input_batch, num_sampled, num_rejected)
-        if not dummy_run and not aux_hidden_states:
-            raise ValueError(
-                "MMuse requires the trained mean-HC auxiliary feature list"
-            )
-        if not dummy_run:
-            expected = model.config.mmuse_source_config["aux_hidden_state_layer_ids"]
-            if len(aux_hidden_states) != len(expected) or any(
-                state.ndim != 2
-                or state.shape[0] != input_batch.positions.shape[0]
-                or state.shape[1] != self.hidden_size
-                for state in aux_hidden_states
-            ):
-                raise ValueError(
-                    "MMuse auxiliary tensors do not match "
-                    "trained layers and target rows"
-                )
-        projected = (
-            model.project_features(torch.cat(aux_hidden_states, -1))
-            if aux_hidden_states
-            else None
+        projected = self._project_target_features(
+            input_batch, aux_hidden_states, dummy_run
         )
         starts = input_batch.query_start_loc[:count].tolist()
         ends = (
@@ -119,41 +126,34 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
         sampled = num_sampled[:count].tolist()
         hidden_blocks, anchor_ids, source_positions = [], [], []
         model.history.storage = model.feature_storage
-        for row in range(count):
-            slot = int(input_batch.idx_mapping_np[row])
+        for batch_row in range(count):
+            request_slot = int(input_batch.idx_mapping_np[batch_row])
             if dummy_run:
                 length = model.feature_storage.shape[1]
                 context_positions = torch.arange(length, device=self.device)
-                features = torch.zeros_like(model.feature_storage[slot])
+                features = torch.zeros_like(model.feature_storage[request_slot])
                 anchor = torch.tensor(model.config.mask_token_id, device=self.device)
             else:
-                start, end = starts[row], ends[row]
+                start, end = starts[batch_row], ends[batch_row]
                 if end <= start:
                     raise ValueError("MMuse requires a nonempty verified target span")
                 context_positions, features = model.history.append(
-                    slot,
-                    input_batch.req_ids[row],
+                    request_slot,
+                    input_batch.req_ids[batch_row],
                     input_batch.positions[start:end],
                     projected[start:end],
                 )
                 anchor = (
-                    last_sampled[slot] if sampled[row] else next_prefill_tokens[0, slot]
+                    last_sampled[request_slot]
+                    if sampled[batch_row]
+                    else next_prefill_tokens[0, request_slot]
                 ).reshape(())
-            positions = (
-                context_positions[-1] + 1 + torch.arange(block, device=self.device)
-            )
-            ids = torch.full(
-                (block,),
-                model.config.mask_token_id,
-                device=self.device,
-                dtype=torch.long,
-            )
-            ids[0] = anchor
+            ids, positions = self._build_query(context_positions, anchor)
             cache_args = {}
             if not dummy_run and getattr(model, "context_kv_cache", None) is not None:
                 cache_args = dict(
-                    cache_slot=slot,
-                    request_id=input_batch.req_ids[row],
+                    cache_slot=request_slot,
+                    request_id=input_batch.req_ids[batch_row],
                     update_start=input_batch.positions[start].item(),
                 )
             hidden_blocks.append(
@@ -186,8 +186,4 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
             sample_token=sample_token if self.draft_logits is not None else None,
         )
         self.draft_tokens[:count].copy_(proposals)
-        if trace is not None and not dummy_run and trace.proposals < trace.limit:
-            trace.proposal(
-                input_batch, hidden, torch.stack(anchor_ids), positions, proposals
-            )
         return self.draft_tokens[:count]
