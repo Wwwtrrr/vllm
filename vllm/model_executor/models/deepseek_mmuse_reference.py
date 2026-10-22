@@ -207,6 +207,19 @@ class DeepseekMMuseReference(nn.Module):
                 else "runtime." + name
             )
             if (
+                name in (
+                    "layer_fusion_gate",
+                    "context_hidden_gate",
+                    "correction_markov_scale",
+                )
+                and destination in parameters
+                and value.shape in ((), (1,))
+                and parameters[destination].shape in ((), (1,))
+            ):
+                # FSDP2 exports these scalar gates as [1]; older checkpoints
+                # use []. Only change their layout, never the learned value.
+                value = value.reshape(parameters[destination].shape)
+            if (
                 destination not in parameters
                 or parameters[destination].shape != value.shape
             ):

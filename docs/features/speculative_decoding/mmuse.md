@@ -17,6 +17,9 @@ slots and exclude the final teacher HC-head slot.
 trained residual order. Fusion, Selector, Markov and Correction use the existing
 inference-only MMuse modules; serving does not import the training package.
 Missing, unexpected and incorrectly shaped trained tensors fail loading.
+The three scalar gates (`layer_fusion_gate`, `context_hidden_gate`, and
+`correction_markov_scale`) accept both legacy scalar `[]` and FSDP2 `[1]`
+checkpoint layouts without changing their values. Other shapes stay strict.
 Legacy enhanced DSpark exports follow the training migration flags; baseline
 DSpark retains its own loader.
 

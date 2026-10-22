@@ -457,3 +457,47 @@ def test_quarot_uses_teacher_io_and_unrotates_each_layer_before_fusion():
     owner.checkpoint_head = None
     with pytest.raises(ValueError, match="original training teacher"):
         namespace["bind_target"](owner, object(), rotation=rotation)
+
+
+@pytest.mark.parametrize(
+    "name", ["layer_fusion_gate", "context_hidden_gate", "correction_markov_scale"]
+)
+@pytest.mark.parametrize("source_shape,target_shape", [((), (1,)), ((1,), ())])
+def test_checkpoint_scalar_gate_layout_preserves_value(
+    name, source_shape, target_shape
+):
+    path = DIRECTORY.parent / "deepseek_mmuse_reference.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepseekMMuseReference"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
+    )
+    namespace = dict(torch=torch)
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    parameter = torch.nn.Parameter(torch.zeros(target_shape))
+    destination = "runtime." + name
+    owner = SimpleNamespace(named_parameters=lambda: [(destination, parameter)])
+    value = torch.tensor(-0.625).reshape(source_shape)
+    loaded = namespace["load_weights"](owner, [(name, value)])
+    assert loaded == {destination}
+    assert parameter.shape == target_shape
+    torch.testing.assert_close(parameter, value.reshape(target_shape))
+    # Equal numel alone does not authorize arbitrary shape conversion.
+    with pytest.raises(ValueError, match="Unexpected MMuse"):
+        namespace["load_weights"](owner, [(name, value.reshape(1, 1))])
+    with pytest.raises(ValueError, match="Unexpected MMuse"):
+        namespace["load_weights"](owner, [(name, torch.zeros(2))])
+    other = SimpleNamespace(named_parameters=lambda: [("norm.weight", parameter)])
+    with pytest.raises(ValueError, match="Unexpected MMuse"):
+        namespace["load_weights"](other, [("norm.weight", value)])
+    with pytest.raises(ValueError, match="Missing trained"):
+        namespace["load_weights"](owner, [])
