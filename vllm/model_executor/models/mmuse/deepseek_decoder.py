@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Replicated, stateless block decoder matching MMuse's offline evaluator.
+"""Replicated block decoder matching MMuse's offline evaluator.
 
 No AttentionLayerBase modules or paged draft KV are registered. Target TP is
 independent: every rank executes the complete dense drafter and its heads.
+Confirmed-context KV may be supplied separately; query KV remains ephemeral.
 """
 
 import torch
@@ -63,13 +64,23 @@ class BlockAttention(nn.Module):
         self.q_norm = RMS(self.dim, config.rms_norm_eps)
         self.k_norm = RMS(self.dim, config.rms_norm_eps)
 
-    def forward(self, query, context, positions, context_positions):
+    def project_kv(self, hidden, positions):
+        k = self.k_norm(self.k_proj(hidden).reshape(-1, self.kv_heads, self.dim))
+        v = self.v_proj(hidden).reshape(-1, self.kv_heads, self.dim)
+        return rotate(k, positions, self.theta), v
+
+    def forward(self, query, context, positions, context_positions, context_kv=None):
         q = self.q_norm(self.q_proj(query).reshape(-1, self.heads, self.dim))
-        joined = torch.cat((context, query))
-        key_positions = torch.cat((context_positions, positions))
-        k = self.k_norm(self.k_proj(joined).reshape(-1, self.kv_heads, self.dim))
-        v = self.v_proj(joined).reshape(-1, self.kv_heads, self.dim)
-        q, k = rotate(q, positions, self.theta), rotate(k, key_positions, self.theta)
+        q = rotate(q, positions, self.theta)
+        if context_kv is None:
+            k, v = self.project_kv(
+                torch.cat((context, query)),
+                torch.cat((context_positions, positions)),
+            )
+        else:
+            query_k, query_v = self.project_kv(query, positions)
+            k = torch.cat((context_kv[0], query_k))
+            v = torch.cat((context_kv[1], query_v))
         groups = self.heads // self.kv_heads
         k = k.transpose(0, 1).repeat_interleave(groups, 0)
         v = v.transpose(0, 1).repeat_interleave(groups, 0)
@@ -125,13 +136,15 @@ class BlockLayer(nn.Module):
                 )
             setattr(self, name, conv)
 
-    def forward(self, hidden, context, positions, context_positions):
+    def forward(self, hidden, context, positions, context_positions, context_kv=None):
         residual = hidden
         value = self.input_layernorm(hidden)
         coefficients = None
         if self.attention_conv is not None:
             value, coefficients = self.attention_conv.prepare(value)
-        value = self.self_attn(value, context, positions, context_positions)
+        value = self.self_attn(
+            value, context, positions, context_positions, context_kv=context_kv
+        )
         if self.attention_conv is not None:
             value = self.attention_conv.finish(value, coefficients)
         hidden = residual + value

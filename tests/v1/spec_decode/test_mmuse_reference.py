@@ -75,6 +75,121 @@ def test_verified_history_replaces_rejected_suffix_and_isolates_requests():
     torch.testing.assert_close(values, replacement)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("window", [4, None])
+@torch.inference_mode()
+def test_cached_context_matches_recompute_after_window_rejection_and_slot_reuse(
+    dtype, window
+):
+    decoder, contract = module("deepseek_decoder"), module("deepseek_contract")
+    path = DIRECTORY.parent / "deepseek_mmuse_reference.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DeepseekMMuseReference"
+    )
+    forward = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == "forward"
+    )
+    namespace = dict(torch=torch, F=torch.nn.functional)
+    exec(
+        compile(ast.Module(body=[forward], type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    torch.manual_seed(51)
+    config = SimpleNamespace(
+        hidden_size=8,
+        intermediate_size=16,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        attention_bias=False,
+        rms_norm_eps=1e-6,
+        rope_parameters={"rope_theta": 10000.0},
+    )
+    layers = torch.nn.ModuleList(
+        [
+            decoder.BlockLayer(
+                config,
+                {
+                    "block_size": 3,
+                    "dflash2_dynamic_conv": True,
+                    "dflash2_conv_group_size": 4,
+                },
+                window,
+            )
+            for _ in range(2)
+        ]
+    ).to(dtype=dtype)
+    capacity = window or 16
+    storage = torch.empty(2, 2, 2, capacity, 1, 4, dtype=dtype)
+    owner = SimpleNamespace(
+        hidden_norm=decoder.RMS(8, 1e-6).to(dtype=dtype),
+        norm=decoder.RMS(8, 1e-6).to(dtype=dtype),
+        embedding_weight=torch.randn(32, 8, dtype=dtype),
+        layers=layers,
+        runtime=SimpleNamespace(
+            block_position_embedding=None, context_hidden_proj=None
+        ),
+        context_kv_storage=storage,
+        context_kv_cache=contract.ContextKVCache(storage),
+    )
+    projected_rows = []
+    handles = [
+        layer.self_attn.k_proj.register_forward_pre_hook(
+            lambda _module, args: projected_rows.append(args[0].shape[0])
+        )
+        for layer in layers
+    ]
+    features = torch.randn(10, 8, dtype=dtype)
+    ids = torch.tensor([7, 30, 30])
+    # Includes extension, window eviction, overlapping corrected suffix,
+    # request reorder (slot 1) and a different request reusing slot 0.
+    rounds = [
+        (0, "a", 3, 0),
+        (0, "a", 5, 3),
+        (0, "a", 6, 5),
+        (1, "b", 3, 0),
+        (0, "a", 6, 4),
+        (0, "new", 3, 0),
+    ]
+    reused_counts = []
+    for slot, request, end, update in rounds:
+        if update == 4:
+            features[4:6] += 0.5
+        start = max(0, end - capacity)
+        context_pos = torch.arange(start, end)
+        positions = torch.arange(end, end + 3)
+        args = (ids, positions, context_pos, features[start:end])
+        expected = namespace["forward"](owner, *args)
+        projected_rows.clear()
+        actual = namespace["forward"](
+            owner, *args, cache_slot=slot, request_id=request, update_start=update
+        )
+        tolerance = 0.03 if dtype == torch.bfloat16 else 2e-6
+        torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+        # Per layer, only newly confirmed context rows and query rows project.
+        reused_counts.append(end - start - (sum(projected_rows) // len(layers) - 3))
+    assert reused_counts[0] == 0
+    assert reused_counts[1] > 0
+    assert reused_counts[3] == reused_counts[5] == 0
+    assert owner.context_kv_cache.entries[0][0] == "new"
+    for handle in handles:
+        handle.remove()
+
+
+def test_context_kv_cache_failure_invalidates_previous_entry():
+    cache = module("deepseek_contract").ContextKVCache(torch.zeros(1, 1, 2, 4, 1, 2))
+    cache.commit(0, "request", 0, 4)
+    assert cache.begin(0, "request", 1, 5, 4) == 3
+    # Simulate a failure before all layer writes finish: begin removed metadata.
+    assert 0 not in cache.entries
+    assert cache.begin(0, "request", 1, 5, 4) == 0
+
+
 @pytest.mark.parametrize(
     "bad", [None, "eager", "prefix", "teacher", "order", "geometry", "contract"]
 )
@@ -155,6 +270,70 @@ def test_reference_decoder_registers_no_paged_attention():
     assert layer.self_attn.q_proj.weight.shape == (32, 16)
 
 
+def test_target_dispatch_keeps_deepseek_tp_and_sliding_attention_support(monkeypatch):
+    path = DIRECTORY.parent / "mmuse_runtime.py"
+    tree = ast.parse(path.read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    namespace = dict(torch=torch, nn=torch.nn)
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
+        namespace,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.models.mmuse.deepseek_contract",
+        module("deepseek_contract"),
+    )
+    source = dict(
+        transformer_layer_config=dict(
+            model_type="qwen3",
+            hidden_size=16,
+            vocab_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+        ),
+        target_hidden_state_format="deepseek_v4_mean_hc_head",
+        aux_hidden_state_layer_ids=[1, 3],
+        block_size=7,
+        enable_correction_head=True,
+    )
+    target = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="deepseek_v4"),
+        enforce_eager=True,
+        dtype=torch.bfloat16,
+        get_total_num_hidden_layers=lambda: 5,
+        get_hidden_size=lambda: 16,
+        get_vocab_size=lambda: 32,
+    )
+    config = SimpleNamespace(
+        model_config=target,
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    mmuse_source_config=source, layer_types=["sliding_attention"]
+                ),
+                quantization=None,
+            ),
+            enforce_eager=True,
+            num_speculative_tokens=7,
+            draft_sample_method="greedy",
+            enable_adaptive_verification=False,
+            use_local_argmax_reduction=False,
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+    )
+    namespace["validate_mmuse_config"](config)
+    target.hf_config.model_type = "qwen3"
+    with pytest.raises(ValueError, match="tensor_parallel_size=1"):
+        namespace["validate_mmuse_config"](config)
+    # Common source validation still precedes target-specific dispatch.
+    config.speculative_config.draft_model_config.hf_config.mmuse_source_config = None
+    with pytest.raises(ValueError, match="Speculators-format"):
+        namespace["validate_mmuse_config"](config)
+
+
 def reference_proposer():
     path = DIRECTORY.parents[2] / "v1/worker/gpu/spec_decode/mmuse/reference.py"
     tree = ast.parse(path.read_text())
@@ -193,6 +372,65 @@ def reference_proposer():
     proposer.model = Model()
     proposer.model.runtime = Runtime()
     return proposer
+
+
+def test_probabilistic_reference_proposer_caches_final_logits_by_slot_and_position():
+    proposer = reference_proposer()
+    proposer.model.feature_storage = torch.empty(4, 4, 3)
+    proposer.draft_logits = torch.full((4, 3, 5), -99.0, dtype=torch.bfloat16)
+    proposer.use_fp64_gumbel = False
+    batch = SimpleNamespace(
+        num_reqs=2,
+        query_start_loc=torch.tensor([0, 2, 4]),
+        positions=torch.tensor([0, 1, 0, 1]),
+        idx_mapping_np=[2, 0],
+        idx_mapping=torch.tensor([2, 0], dtype=torch.int32),
+        req_ids=["a", "b"],
+    )
+    temperatures = torch.tensor([1.0, 0.0, 0.7, 1.5])
+    seeds = torch.tensor([11, 12, 13, 14])
+    observed = []
+
+    def sample(logits, slots, temperature, actual_seeds, positions, **kwargs):
+        assert temperature is temperatures and actual_seeds is seeds
+        assert kwargs["apply_temperature"] and kwargs["is_drafting"]
+        assert logits.dtype == proposer.draft_logits.dtype
+        cols = kwargs["logits_cache_col"].long()
+        kwargs["logits_cache"][slots.long(), cols] = logits
+        observed.append((positions.clone(), logits.clone()))
+        return torch.multinomial(
+            torch.softmax(logits.float() / temperature[slots.long(), None], -1), 1
+        )[:, 0]
+
+    proposer.sample = sample
+
+    def rollout(hidden, anchors, *, temperature, sample_token):
+        assert temperature == 0.0  # Native callback owns per-request temperature.
+        tokens = []
+        for column in range(3):
+            logits = torch.arange(10).reshape(2, 5).float() * (column + 1) / 7
+            tokens.append(sample_token(logits, column))
+        return torch.stack(tokens, 1), None
+
+    proposer.model.runtime.rollout_correction = rollout
+    output = proposer.propose(
+        batch,
+        {},
+        {},
+        None,
+        [torch.randn(4, 3)],
+        torch.tensor([1, 1]),
+        torch.tensor([0, 0]),
+        torch.tensor([[9], [8], [7], [6]]),
+        torch.zeros(1, 4, dtype=torch.long),
+        temperatures,
+        seeds,
+    )
+    assert output.shape == (2, 3)
+    for column, (positions, logits) in enumerate(observed):
+        torch.testing.assert_close(positions, torch.tensor([2 + column, 2 + column]))
+        torch.testing.assert_close(proposer.draft_logits[[2, 0], column], logits)
+    assert (proposer.draft_logits[[1, 3]] == -99).all()
 
 
 @pytest.mark.parametrize("column_tokens", [False, True])

@@ -22,18 +22,36 @@ def validate_mmuse_config(config) -> None:
     hf = spec.draft_model_config.hf_config
     source = getattr(hf, "mmuse_source_config", None)
 
-    # Required configuration and interfaces used by the Qwen3 adapter.
     if not source:
         raise ValueError("MMuse requires a Speculators-format MMuse checkpoint")
-    if config.model_config.hf_config.model_type == "deepseek_v4":
-        from vllm.model_executor.models.mmuse.deepseek_contract import (
-            validate_deepseek_export,
-        )
 
-        validate_deepseek_export(config, source)
-        return
-    if config.model_config.hf_config.model_type != "qwen3":
+    validators = {
+        "qwen3": _validate_qwen3_mmuse,
+        "deepseek_v4": _validate_deepseek_mmuse,
+    }
+    validator = validators.get(config.model_config.hf_config.model_type)
+    if validator is None:
         raise ValueError("MMuse reference adapter requires a Qwen3 target")
+    validator(config, source)
+
+
+def _validate_deepseek_mmuse(config, source) -> None:
+    """Keep DeepSeek's independent execution contract and lazy imports."""
+    from vllm.model_executor.models.mmuse.deepseek_contract import (
+        validate_deepseek_export,
+    )
+
+    validate_deepseek_export(config, source)
+
+
+def _validate_qwen3_mmuse(config, source) -> None:
+    _validate_qwen3_interfaces(config, source)
+    _validate_qwen3_execution(config)
+    _validate_qwen3_sampling(config, source)
+
+
+def _validate_qwen3_interfaces(config, source) -> None:
+    """Check the trained decoder and target auxiliary-layer interface."""
     if source["transformer_layer_config"].get("model_type") != "qwen3":
         raise ValueError("MMuse reference adapter requires a Qwen3 draft decoder")
     layer_ids = source["aux_hidden_state_layer_ids"]
@@ -41,7 +59,10 @@ def validate_mmuse_config(config) -> None:
     if not layer_ids or any(i < 1 or i > num_layers for i in layer_ids):
         raise ValueError("MMuse auxiliary layer IDs exceed the target's layer range")
 
-    # Execution modes not yet covered by this adapter.
+
+def _validate_qwen3_execution(config) -> None:
+    """Check parallel and attention modes covered by the Qwen3 adapter."""
+    hf = config.speculative_config.draft_model_config.hf_config
     parallel = config.parallel_config
     for name in (
         "tensor_parallel_size",
@@ -58,7 +79,10 @@ def validate_mmuse_config(config) -> None:
     ):
         raise ValueError("MMuse reference adapter requires full-attention draft layers")
 
-    # Additional contracts for the probabilistic sampler and its logits cache.
+
+def _validate_qwen3_sampling(config, source) -> None:
+    """Check probabilistic sampling and its logits-cache contract."""
+    spec = config.speculative_config
     if spec.draft_sample_method == "probabilistic":
         if not config.model_config.enforce_eager or not spec.enforce_eager:
             raise ValueError("MMuse probabilistic drafting requires enforce_eager=True")

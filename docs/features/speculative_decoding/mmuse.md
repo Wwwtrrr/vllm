@@ -1,6 +1,6 @@
 # MMuse reference adapters
 
-## DeepSeek-V4: stateless reference implementation
+## DeepSeek-V4: reference implementation
 
 For `method="mmuse"` and a `deepseek_v4` target, the V2 worker selects
 `MMuseReferenceSpeculator`; Ascend selects `AscendMMuseReferenceSpeculator`.
@@ -44,7 +44,7 @@ The declared rotation path is tried first, then `optional/<filename>` inside
 the Target directory for exports with a stale `../optional/` relative path.
 These interface checks do not establish numerical parity with the training
 teacher; verify acceptance and feature parity on the real checkpoint.
-Replication and context recomputation increase memory and compute costs: this
+Replication and optional context recomputation increase memory and compute costs: this
 is a correctness reference, not a throughput optimization. Target backbone
 quantization remains the backend's responsibility. Interface checks do not prove
 that the serving Target weights match the training teacher numerically.
@@ -54,6 +54,43 @@ Require BF16 activations, an unquantized draft, eager Target and Draft,
 may exceed one; Draft computation is replicated. Adaptive verification,
 watermarking and local argmax reduction are rejected. FULL graphs are not
 implemented for this path.
+
+### Optional confirmed-context KV reuse
+
+Set `additional_config["mmuse_draft_kv_reuse"] = True` to cache the replicated
+DeepSeek draft's context K/V projections. This is disabled by default. Each
+layer keeps only confirmed context K/V after normalization and RoPE; synthetic
+query K/V is always recomputed. Cache identity includes the persistent request
+slot and request ID. Overwritten suffixes are reprojected and sliding windows
+evict old positions. Dummy/profile calls do not commit request state.
+
+The buffers are reserved before memory profiling. Additional memory is
+`2 * layers * max_num_seqs * capacity * kv_heads * head_dim * dtype_bytes`,
+where capacity is the sliding window for all-sliding decoders and otherwise
+`max_model_len`. For 5 layers, 4 requests, a 2048 window, 8 KV heads and head
+dimension 256 in BF16 this is 320 MiB per Target TP rank. Prefix movement still
+copies cached rows; measured throughput gains depend on the real workload.
+Compare enabled/disabled logits, acceptance and steady-state throughput on NPU
+before adopting it. This does not enable Target prefix caching or FULL graphs.
+
+### Nonzero temperature validation
+
+Target `temperature=1.0` can use either `draft_sample_method="greedy"` or
+`"probabilistic"`. The latter caches final Correction logits in persistent
+request/column slots before temperature scaling. Native verification applies
+the request temperature to those logits and performs probability-ratio
+acceptance plus residual resampling. Correction feedback uses the actual sampled
+token, not an unrelated argmax. Keep eager mode and begin with `top_p=1`,
+`top_k=-1` and repetition penalty 1 when validating the interface.
+
+CPU tests verify cache routing/feedback and context-KV parity, but do not prove
+the native NPU sampling distribution. A focused one-card kernel test is in
+`vllm-ascend/tests/e2e/pull_request/one_card/test_gumbel_sampling.py`, selected by
+`-k mmuse_probabilistic_proposal`. It calls the actual MMuse NPU sampler binding
+and native rejection/resampling, checking proposal and output frequencies at
+temperatures 1.0 and 0.7 with FP32/BF16 caches. Run in the matching installed
+Ascend test environment; no large model weights are needed. This is not a
+substitute for end-to-end acceptance and performance tests with the actual models.
 
 Retain the working Target quantization/tokenizer settings and set:
 

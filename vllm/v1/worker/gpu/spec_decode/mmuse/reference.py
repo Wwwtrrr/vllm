@@ -149,7 +149,16 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
                 dtype=torch.long,
             )
             ids[0] = anchor
-            hidden_blocks.append(model(ids, positions, context_positions, features))
+            cache_args = {}
+            if not dummy_run and getattr(model, "context_kv_cache", None) is not None:
+                cache_args = dict(
+                    cache_slot=slot,
+                    request_id=input_batch.req_ids[row],
+                    update_start=input_batch.positions[start].item(),
+                )
+            hidden_blocks.append(
+                model(ids, positions, context_positions, features, **cache_args)
+            )
             anchor_ids.append(anchor)
             source_positions.append(positions)
         hidden = torch.stack(hidden_blocks)

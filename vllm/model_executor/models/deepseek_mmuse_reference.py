@@ -12,7 +12,10 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.model_executor.models.mmuse.deepseek_contract import VerifiedPrefix
+from vllm.model_executor.models.mmuse.deepseek_contract import (
+    ContextKVCache,
+    VerifiedPrefix,
+)
 from vllm.model_executor.models.mmuse.deepseek_decoder import RMS, BlockLayer
 from vllm.model_executor.models.mmuse.runtime import MMuseRuntime
 from vllm.model_executor.models.mmuse_runtime import validate_mmuse_config
@@ -39,7 +42,7 @@ class BorrowedIO(nn.Module):
 
 
 class DeepseekMMuseReference(nn.Module):
-    """Replicate the small draft on each target TP rank; no draft KV allocation."""
+    """Replicate the draft on each target TP rank; no draft paged-KV allocation."""
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
@@ -93,6 +96,31 @@ class DeepseekMMuseReference(nn.Module):
             persistent=False,
         )
         self.history = VerifiedPrefix(capacity, self.feature_storage)
+        reuse = (getattr(vllm_config, "additional_config", None) or {}).get(
+            "mmuse_draft_kv_reuse", False
+        )
+        if type(reuse) is not bool:
+            raise ValueError("mmuse_draft_kv_reuse must be a boolean")
+        dim = self.config.head_dim or h // self.config.num_attention_heads
+        self.register_buffer(
+            "context_kv_storage",
+            torch.empty(
+                len(self.layers),
+                vllm_config.scheduler_config.max_num_seqs,
+                2,
+                capacity,
+                self.config.num_key_value_heads,
+                dim,
+                dtype=self.feature_storage.dtype,
+                device=self.feature_storage.device,
+            )
+            if reuse
+            else None,
+            persistent=False,
+        )
+        self.context_kv_cache = (
+            ContextKVCache(self.context_kv_storage) if reuse else None
+        )
 
     def bind_target(self, target, rotation=None):
         if rotation is not None:
@@ -158,8 +186,31 @@ class DeepseekMMuseReference(nn.Module):
             )
         return self.runtime._prepare_target_hidden(features)[0]
 
-    def forward(self, input_ids, positions, context_positions, projected_context):
+    def forward(
+        self,
+        input_ids,
+        positions,
+        context_positions,
+        projected_context,
+        *,
+        cache_slot=None,
+        request_id=None,
+        update_start=None,
+    ):
         context = self.hidden_norm(projected_context)
+        cache = getattr(self, "context_kv_cache", None)
+        use_cache = cache is not None and cache_slot is not None
+        reused = 0
+        if use_cache:
+            if torch.is_grad_enabled():
+                raise ValueError("MMuse context KV reuse is inference-only")
+            if request_id is None or update_start is None:
+                raise ValueError(
+                    "MMuse context KV requires request identity and update span"
+                )
+            start, end = context_positions[0].item(), context_positions[-1].item() + 1
+            cache.storage = self.context_kv_storage
+            reused = cache.begin(cache_slot, request_id, start, end, update_start)
         hidden = F.embedding(input_ids, self.embedding_weight)
         if self.runtime.block_position_embedding is not None:
             hidden = hidden + self.runtime.block_position_embedding(
@@ -169,9 +220,24 @@ class DeepseekMMuseReference(nn.Module):
             hidden = hidden + torch.tanh(
                 self.runtime.context_hidden_gate
             ) * self.runtime.context_hidden_proj(context[-1:])
-        for layer in self.layers:
-            hidden = layer(hidden, context, positions, context_positions)
-        return self.norm(hidden)
+        for index, layer in enumerate(self.layers):
+            context_kv = None
+            if use_cache:
+                storage = self.context_kv_storage[index, cache_slot]
+                if reused < context.shape[0]:
+                    key, value = layer.self_attn.project_kv(
+                        context[reused:], context_positions[reused:]
+                    )
+                    storage[0, reused : context.shape[0]].copy_(key)
+                    storage[1, reused : context.shape[0]].copy_(value)
+                context_kv = storage[:, : context.shape[0]]
+            hidden = layer(
+                hidden, context, positions, context_positions, context_kv=context_kv
+            )
+        output = self.norm(hidden)
+        if use_cache:
+            cache.commit(cache_slot, request_id, start, end)
+        return output
 
     def load_weights(self, weights):
         parameters = dict(self.named_parameters())
@@ -207,7 +273,8 @@ class DeepseekMMuseReference(nn.Module):
                 else "runtime." + name
             )
             if (
-                name in (
+                name
+                in (
                     "layer_fusion_gate",
                     "context_hidden_gate",
                     "correction_markov_scale",

@@ -139,3 +139,38 @@ class VerifiedPrefix:
         owned.copy_(joined)
         self.requests[slot] = (request_id, joined_positions, owned)
         return joined_positions, owned
+
+
+class ContextKVCache:
+    """Bounded per-slot context-only KV; synthetic query KV is never committed.
+
+    Storage is [layers, request slots, K/V, capacity, KV heads, head dim].
+    The caller supplies a contiguous confirmed prefix and the first position
+    updated by the current Target step. An overwritten suffix is reprojected.
+    """
+
+    def __init__(self, storage):
+        self.storage = storage
+        self.entries = {}
+
+    def begin(self, slot, request_id, start, end, update_start):
+        capacity = self.storage.shape[3]
+        if not 0 <= start < end or end - start > capacity:
+            raise ValueError("MMuse context KV span exceeds its reserved capacity")
+        previous = self.entries.pop(slot, None)
+        reused = 0
+        if previous is not None:
+            old_request, old_start, old_end = previous
+            if old_request == request_id and old_start <= start < old_end:
+                reused = max(0, min(old_end, update_start, end) - start)
+                shift = start - old_start
+                if reused and shift:
+                    # copy_ cannot safely move overlapping storage slices.
+                    self.storage[:, slot, :, :reused].copy_(
+                        self.storage[:, slot, :, shift : shift + reused].clone()
+                    )
+        # Metadata stays invalid until every layer has completed successfully.
+        return reused
+
+    def commit(self, slot, request_id, start, end):
+        self.entries[slot] = (request_id, start, end)
