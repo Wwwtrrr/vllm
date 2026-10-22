@@ -60,6 +60,15 @@ class MMuseTrace:
         positions = batch.positions[indices].tolist()
         input_ids = batch.input_ids[indices].tolist()
         predictions = logits.argmax(-1).tolist()
+        top_values, top_ids = logits.topk(min(5, logits.shape[-1]), dim=-1)
+        top_values = top_values.tolist()
+        top_ids = top_ids.tolist()
+        # Only within-request successor scores are used below; boundary rows
+        # have no candidate comparison.
+        candidate_ids = batch.input_ids[indices].roll(-1).long()
+        candidate_scores = (
+            logits.gather(1, candidate_ids.unsqueeze(1)).squeeze(1).tolist()
+        )
         cu = batch.cu_num_logits_np.tolist()
         prefill_lengths = batch.prefill_len_np.tolist()
         rows = []
@@ -90,6 +99,10 @@ class MMuseTrace:
                         if placeholder or expected is None
                         else candidate == expected,
                         target_argmax=predictions[index],
+                        candidate_logit=candidate_scores[index],
+                        target_top1_minus_candidate=(
+                            top_values[index][0] - candidate_scores[index]
+                        ),
                         argmax_matches=None
                         if placeholder
                         else candidate == predictions[index],
@@ -105,6 +118,8 @@ class MMuseTrace:
                     input_positions=positions[start:end],
                     input_ids=input_ids[start:end],
                     target_argmax=predictions[start:end],
+                    target_top_ids=top_ids[start:end],
+                    target_top_logits=top_values[start:end],
                     comparisons=comparisons,
                 )
             )

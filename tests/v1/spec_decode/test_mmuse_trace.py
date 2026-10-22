@@ -65,6 +65,12 @@ def test_trace_pairs_requests_by_id_and_positions_not_batch_order(caplog):
     assert [x["request_id"] for x in rows] == ["b", "a"]
     assert all(x["transport_matches"] for row in rows for x in row["comparisons"])
     assert [x["argmax_matches"] for x in rows[0]["comparisons"]] == [True, False, True]
+    assert rows[0]["target_top_ids"][1][0] == 2
+    assert rows[0]["target_top_logits"][1][0] == 10
+    assert rows[0]["comparisons"][0]["candidate_logit"] == 10
+    assert rows[0]["comparisons"][1]["candidate_logit"] == 0
+    assert rows[0]["comparisons"][1]["target_top1_minus_candidate"] == 10
+    assert rows[1]["comparisons"][0]["candidate_logit"] == 10
     assert output[2]["num_sampled"] == [2, 4]
     torch.testing.assert_close(before, logits)
     batch.input_ids[5] = 12
