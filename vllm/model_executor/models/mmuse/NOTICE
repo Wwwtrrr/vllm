@@ -1,0 +1,3 @@
+Derived from local MMuse/Speculators (Apache-2.0), baseline commit a67321848a2f4bf12126a7213ef381d162b8e127.
+Modified for vLLM: local imports, inference-only methods, standalone config and nn.Module construction; no training registry, losses or trainer.
+source_manifest.json records SHA256 of the source files at extraction.

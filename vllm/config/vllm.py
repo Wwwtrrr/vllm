@@ -3085,7 +3085,7 @@ class VllmConfig:
             # own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method not in ("dflash", "dspark", "mmuse")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 
