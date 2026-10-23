@@ -614,6 +614,8 @@ class GPUModelRunner(
                 | Gemma4Proposer
                 | Step3p5MTPProposer
             )
+            if self.speculative_config.use_mmuse():
+                raise ValueError("MMuse requires Model Runner V2")
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
                     self.vllm_config

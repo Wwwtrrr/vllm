@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 SUPPORTED_SPECULATORS_TYPES = {}
 
 
@@ -149,6 +151,57 @@ def update_dflash2(config_dict: dict, pre_trained_config: dict) -> None:
             pre_trained_config["dflash_config"][key] = config_dict[key]
 
 
+@register_speculator("mmuse")
+def update_mmuse(config_dict: dict, pre_trained_config: dict) -> None:
+    """Preserve MMuse's identity and options without selecting a baseline model.
+
+    Runtime model registration and speculative dispatch are separate from this
+    configuration conversion; MMuse must not fall back to DSpark or DFlash.
+    """
+    source_config = copy.deepcopy(config_dict)
+    metadata_fields = {
+        "architectures",
+        "model_type",
+        "speculators_config",
+        "transformer_layer_config",
+    }
+    for key, value in config_dict.items():
+        if key not in metadata_fields:
+            pre_trained_config[key] = value
+    pre_trained_config["speculators_model_type"] = "mmuse"
+    pre_trained_config["architectures"] = ["MMuseSpeculator"]
+    if config_dict.get("target_hidden_state_format") == "deepseek_v4_mean_hc_head":
+        pre_trained_config["architectures"] = ["DeepseekMMuseReference"]
+    pre_trained_config["mmuse_source_config"] = source_config
+    aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+    pre_trained_config["target_layer_ids"] = [i - 1 for i in aux_layer_ids]
+
+
+def is_legacy_deepseek_mmuse(config: dict) -> bool:
+    """Match the training checkout's enhanced DSpark-to-MMuse migration."""
+    flags = (
+        "dflash_context_residual",
+        "dflash_block_position_embedding",
+        "dflash_gated_layer_fusion",
+        "dflash2_dynamic_conv",
+        "dflash2_candidate_selector",
+        "enable_correction_head",
+        "correction_hidden_aux_loss",
+        "correction_hidden_feedback",
+        "correction_project_corrected_hidden",
+        "correction_with_markov",
+        "correction_lm_head_fusion",
+        "correction_rollout_metrics",
+        "correction_base_diagnostics",
+    )
+    return config.get("target_hidden_state_format") == "deepseek_v4_mean_hc_head" and (
+        any(config.get(flag, False) for flag in flags)
+        or config.get("selector_correction_feedback", "static") != "static"
+        or config.get("correction_output_mode", "hidden") != "hidden"
+    )
+
+
 @register_speculator("dspark")
 def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     """Apply DSpark specific configuration transformations to the `dict` used to
@@ -172,6 +225,9 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
         False (anchor is a bonus token, only mask tokens predict, yielding
         block_size - 1 speculative tokens).
     """
+    if is_legacy_deepseek_mmuse(config_dict):
+        update_mmuse(config_dict, pre_trained_config)
+        return
     architectures = config_dict.get("architectures") or []
     supported_architectures = {
         "Qwen3DSparkModel",

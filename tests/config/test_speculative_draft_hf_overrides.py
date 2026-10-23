@@ -114,6 +114,70 @@ def test_dspark_width_is_independent_of_mtp_stages(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("method", [None, "mmuse"])
+@pytest.mark.parametrize("architecture", ["MMuseSpeculator", "MMuseDraftModel"])
+def test_mmuse_identity_is_not_rewritten_as_a_baseline(method, architecture):
+    config = _make_speculative_config(
+        dict(model_type="qwen3", architectures=[architecture]),
+        architecture,
+        method=method,
+        num_speculative_tokens=6,
+    )
+
+    assert config.method == "mmuse"
+    assert config.use_mmuse()
+    assert not config.use_dspark()
+    assert not config.use_dflash()
+    assert config.parallel_drafting
+    assert config.draft_model_config.hf_config.architectures == [architecture]
+
+
+@pytest.mark.cpu_test
+def test_mmuse_metadata_takes_precedence_over_dflash_path():
+    hf_config = _make_hf_config(
+        speculators_model_type="mmuse", architectures=["MMuseSpeculator"]
+    )
+    draft = MagicMock(
+        model="old-dflash-experiment",
+        hf_config=hf_config,
+        architectures=hf_config.architectures,
+        max_model_len=128,
+    )
+    target = MagicMock(max_model_len=128, quantization=None, hf_overrides={})
+    with patch("vllm.config.speculative.ModelConfig", return_value=draft):
+        config = SpeculativeConfig(
+            model="old-dflash-experiment",
+            num_speculative_tokens=6,
+            target_model_config=target,
+            target_parallel_config=ParallelConfig(),
+        )
+
+    assert config.method == "mmuse"
+
+
+@pytest.mark.cpu_test
+def test_mmuse_requires_a_separate_draft_checkpoint():
+    with pytest.raises(ValueError, match="requires an explicit draft model"):
+        SpeculativeConfig(method="mmuse", num_speculative_tokens=6)
+
+
+@pytest.mark.cpu_test
+def test_mmuse_hash_includes_target_feature_layers():
+    config = _make_speculative_config(
+        dict(model_type="qwen3", architectures=["MMuseSpeculator"]),
+        "MMuseSpeculator",
+        method="mmuse",
+        num_speculative_tokens=6,
+    )
+    config.draft_model_config.compute_hash.return_value = "same-draft"
+    config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids = [2, 5]
+    original_hash = config.compute_hash()
+    config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids = [2, 6]
+
+    assert config.compute_hash() != original_hash
+
+
+@pytest.mark.cpu_test
 def test_mtp_stages_are_independent_of_dspark_width():
     hf_kwargs = dict(
         model_type="deepseek_v4", num_nextn_predict_layers=3, dspark_block_size=5
