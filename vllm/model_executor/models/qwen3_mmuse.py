@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Eager, single-device Qwen3 MMuse adapter with standalone inference heads."""
+"""Single-device Qwen3 MMuse decoder and capturable greedy inference heads."""
 
 import weakref
 from collections.abc import Iterable
@@ -68,10 +68,14 @@ class MMuseQwen3Model(DFlashQwen3Model):
 
     def __init__(self, *, vllm_config, **kwargs):
         super().__init__(vllm_config=vllm_config, **kwargs)
-        self.context_anchor = torch.zeros(
-            vllm_config.scheduler_config.max_num_seqs,
-            self.config.hidden_size,
-            dtype=vllm_config.model_config.dtype,
+        self.register_buffer(
+            "context_anchor",
+            torch.zeros(
+                vllm_config.scheduler_config.max_num_seqs,
+                self.config.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+            ),
+            persistent=False,
         )
 
     def forward(self, input_ids, positions, input_embeds=None):
