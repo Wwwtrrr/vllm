@@ -140,10 +140,6 @@ def has_compiled_submodule(model: nn.Module) -> bool:
 
 
 class CudaGraphManager:
-    # Backends may need different captured attention kernels for uniform decode
-    # and mixed/prefill batches, even when both use FULL graphs.
-    specialize_full_decode = False
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -313,11 +309,7 @@ class CudaGraphManager:
                 descs_by_mode[decode_mode].append(desc)
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
-            elif (
-                (separate_decode_routine or self.specialize_full_decode)
-                and decode_mode
-                and not self.varlen_decode
-            ):
+            elif separate_decode_routine and decode_mode and not self.varlen_decode:
                 for decode_query_len in decode_query_lens:
                     rounded_num_tokens = round_up(num_tokens, decode_query_len)
                     rounded_num_reqs = rounded_num_tokens // decode_query_len
@@ -373,15 +365,7 @@ class CudaGraphManager:
                     descs_by_mode[mixed_mode].append(ubatch_desc)
 
         for mode, descs in descs_by_mode.items():
-            # Candidate construction reverses this list. Prefer uniform decode
-            # over a mixed graph of the same size, without changing prefill dispatch.
-            descs.sort(
-                key=lambda d: (
-                    d.num_tokens,
-                    self.specialize_full_decode and d.uniform_token_count is None,
-                ),
-                reverse=True,
-            )
+            descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
 
         for mode in (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE):
