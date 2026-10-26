@@ -124,76 +124,13 @@ do not establish end-to-end correctness or speedup.
 - Speculators-format `speculators_model_type="mmuse"` configuration.
 - `sample_from_anchor=True`, full-attention draft layers, enabled Correction.
 - Fixed proposal length equal to the trained block size (typically 7).
-- Greedy or probabilistic draft proposals on one device. Probabilistic remains
-  eager; greedy has an outer FULL capture path described below.
+- Greedy or probabilistic draft proposals, eager execution, one device.
 - No quantization, watermarking or adaptive verification.
 
 These are implementation limits; commenting out a configuration check does not
 add support for that mode. Model Runner V1 rejects MMuse explicitly.
 The target's generation temperature is separate from the draft sampling mode;
 start evaluation with greedy target requests as well.
-
-## Qwen3 greedy FULL graph path
-
-Target and Draft have separate graphs. The Target retains the framework's
-existing graph path; MMuse captures the Draft decoder and the complete fixed
-Correction/Selector rollout through DFlash's outer `_generate_draft` capture.
-The inner decoder runs with graph mode NONE to avoid nested graph replay. This
-does not disable capture of the outer function. Python configuration branches
-are resolved during capture, while tensor operations consume the current input
-buffers on each replay. `torch.compiler.disable` on the reference heads disables
-Dynamo tracing, not device graph capture.
-
-Draft FULL requires `draft_sample_method="greedy"`, `sample_from_anchor=True`,
-and `num_speculative_tokens` equal to the checkpoint's trained `block_size`.
-The existing single-device/full-attention restrictions still apply. Unsupported
-Attention graph capabilities retain DFlash's existing eager fallback. Draft
-`enforce_eager=True` disables its graph manager without forcing Target eager.
-The context anchor is a non-persistent module buffer: it moves with the model,
-is updated in place before drafting, and does not add checkpoint state.
-Ascend's capture wrapper explicitly forwards the MMuse rollout, including on
-versions without generic model attribute forwarding.
-
-For a checkpoint trained with block size seven, test in this order:
-
-```python
-# Target FULL, Draft eager first; then change only Draft enforce_eager to False.
-llm = LLM(
-    model="/path/to/Qwen3-4B",
-    enforce_eager=False,
-    max_num_seqs=1,
-    compilation_config={
-        "mode": 0,
-        "cudagraph_mode": "FULL",
-        "cudagraph_capture_sizes": [7, 8],
-    },
-    speculative_config={
-        "method": "mmuse",
-        "model": "/path/to/qwen3_4b_mmuse",
-        "num_speculative_tokens": 7,
-        "draft_sample_method": "greedy",
-        "enforce_eager": True,
-    },
-)
-```
-
-MMuse uses seven query rows per request; Target verification usually uses eight.
-For four simultaneous requests include the required multiples, for example
-`[7, 8, 14, 16, 21, 24, 28, 32]`. These are token counts, not request counts.
-Keep capture sizes bounded by scheduler limits. Actual graph dispatch remains
-subject to backend and batch compatibility. No experimental changes to the
-shared Target graph manager or UpdatableGraph event ordering are required.
-
-`tests/v1/spec_decode/test_mmuse_full_graph.py` tests lifecycle contracts and
-replays the real greedy heads with changed inputs/anchors, both with and without
-LM-head fusion. CPU checks run without accelerators; CUDA/NPU replay cases skip
-when unavailable. These synthetic head tests deliberately substitute decoder
-outputs: they do not establish native paged-Attention, scheduling, trained-model
-accuracy or end-to-end throughput. Validate actual checkpoint outputs, rejection,
-request padding/reuse and acceptance against eager before deployment. FULL
-capture success is not a speed guarantee, particularly with Ascend dynamic
-Attention updates. DeepSeek reference and probabilistic MMuse keep their eager
-contracts.
 
 For probabilistic proposals, set `draft_sample_method` to `"probabilistic"`
 in the speculative config and use a positive request temperature. MMuse calls

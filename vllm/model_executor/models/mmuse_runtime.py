@@ -19,27 +19,6 @@ def build_mmuse_runtime(source_config: dict, fc: nn.Module) -> nn.Module:
 class MMuseGreedyRolloutMixin:
     """Shared GPU/NPU rollout with greedy or framework probabilistic sampling."""
 
-    def init_cudagraph_manager(self, cudagraph_mode) -> None:
-        from vllm.config.compilation import CUDAGraphMode
-
-        if self.speculative_config.enforce_eager:
-            cudagraph_mode = CUDAGraphMode.NONE
-        if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL:
-            source = self.draft_model_config.hf_config.mmuse_source_config
-            if self.speculative_config.draft_sample_method != "greedy":
-                raise ValueError(
-                    "MMuse FULL drafting currently requires greedy sampling"
-                )
-            if not source.get("sample_from_anchor", True):
-                raise ValueError("MMuse FULL drafting requires sample_from_anchor=True")
-            if self.num_query_per_req != source["block_size"]:
-                raise ValueError(
-                    "MMuse FULL query length must equal trained block_size"
-                )
-        # DFlash captures _generate_draft, including the MMuse rollout, as one
-        # outer FULL graph. Inner decoder calls must not launch a nested graph.
-        super().init_cudagraph_manager(cudagraph_mode)
-
     def _mmuse_gumbel_sample(self, *args, **kwargs):
         from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
@@ -90,8 +69,6 @@ class MMuseGreedyRolloutMixin:
     ) -> None:
         from vllm.config.compilation import CUDAGraphMode
 
-        if num_reqs and num_tokens_padded != num_reqs * self.num_query_per_req:
-            raise ValueError("MMuse drafting requires complete padded query blocks")
         hidden = self._run_model(
             num_tokens_padded,
             attn_metadata,
