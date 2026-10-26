@@ -15,6 +15,12 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
             )
 
             return MMuseReferenceSpeculator(vllm_config, device)
+        if speculative_config.draft_sample_method == "greedy":
+            from vllm.v1.worker.gpu.spec_decode.mmuse.greedy import (
+                MMuseGreedySpeculator,
+            )
+
+            return MMuseGreedySpeculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.mmuse.speculator import MMuseSpeculator
 
         return MMuseSpeculator(vllm_config, device)

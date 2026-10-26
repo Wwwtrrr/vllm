@@ -124,7 +124,8 @@ do not establish end-to-end correctness or speedup.
 - Speculators-format `speculators_model_type="mmuse"` configuration.
 - `sample_from_anchor=True`, full-attention draft layers, enabled Correction.
 - Fixed proposal length equal to the trained block size (typically 7).
-- Greedy or probabilistic draft proposals, eager execution, one device.
+- Greedy proposals with eager or FULL query execution, one device.
+- Probabilistic draft proposals require eager execution for Target and Draft.
 - No quantization, watermarking or adaptive verification.
 
 These are implementation limits; commenting out a configuration check does not
@@ -148,10 +149,12 @@ validate this extension.
 
 ## Implementation
 
-`MMuseSpeculator` inherits `DFlashSpeculator`; `AscendMMuseSpeculator` inherits
-`AscendDFlashSpeculator`. Both mix in `MMuseGreedyRolloutMixin`. They retain the
-DFlash context insertion and Attention metadata, while selecting an anchor plus
-`block_size - 1` mask queries. All `block_size` positions predict tokens.
+Greedy Qwen3 uses `MMuseGreedySpeculator`, directly derived from the generic
+`DraftModelSpeculator`. Ascend uses `AscendMMuseGreedySpeculator` and its own
+`MMuseAclGraphManager`. Input preparation, model loading and graph capture do
+not call the DFlash proposer or DFlash graph managers. Probabilistic eager
+execution retains the previous `MMuseSpeculator` / `AscendMMuseSpeculator`
+implementation and its DFlash context execution.
 
 `MMuseQwen3ForCausalLM` uses native vLLM Qwen3/DFlash Attention and projections.
 Its decoder wraps Attention and MLP with the source dynamic convolution, preserving
@@ -172,6 +175,74 @@ Missing trainable parameters fail loading. Full-vocabulary embedding and LM-head
 weights are intentionally taken from the target; this is distinct from missing
 trained draft parameters. Confidence weights are loaded but are not used for
 adaptive proposal length in this first version.
+
+### Qwen3 greedy FULL graph boundary
+
+Target uses the framework's original model graph manager. This adapter does not
+change Target attention, capture sizes, synchronization or graph-update ordering.
+Draft has an independent capture lifecycle:
+
+1. Project the current Target auxiliary features and select the last confirmed
+   context anchor, excluding rejected suffixes.
+2. Prepare K query rows per request, context/cache slots and absolute positions
+   in persistent buffers. Null blocks and rejected/padded rows receive PAD slots.
+3. Project and store confirmed context K/V outside the graph. Long prefill
+   contexts follow the same path as decode context.
+4. Build current-step query attention metadata once.
+5. Replay query decoder, complete greedy Correction/Selector/Markov rollout and
+   output-buffer write together. Shapes absent from the capture set run eagerly.
+
+Thus FULL covers the draft query forward and rollout, not the whole proposal
+pipeline, context projection, Target verification or the scheduling loop.
+The model backbone still uses native Qwen3/DFlash attention and weight packing;
+shared MMuse prediction modules are not duplicated.
+
+The Draft's copied compilation configuration uses `CompilationMode.NONE` to
+avoid compiling the eager MMuse Python rollout through Dynamo. This does not
+disable device graph capture and does not change the Target configuration.
+Ascend uses native `UpdatableGraph` task updates with the already-built current
+metadata. It does not remove required events or promise to fix MEM_WAIT overhead.
+Only the updatable full-attention backend is supported by this independent NPU
+path; unsupported graph backends fail explicitly.
+
+For a checkpoint with K=7 and `max_num_seqs=1`, retain the existing model/dtype/
+tokenizer settings and use:
+
+```python
+enforce_eager = False  # Target
+speculative_config = {
+    "method": "mmuse",
+    "model": "/path/to/qwen3_4b_mmuse",
+    "num_speculative_tokens": 7,
+    "draft_sample_method": "greedy",
+    "enforce_eager": False,
+}
+compilation_config = {
+    "mode": 0,
+    "cudagraph_mode": "FULL",
+    "cudagraph_capture_sizes": [7, 8],
+}
+```
+
+Use Model Runner V2. Sizes count tokens, not requests: Draft needs a complete
+7-row block; Target verification can need 8 rows. For BS4 include 28 and 32,
+and preserve smaller capture sizes to exercise shrinking batches. K must equal
+the checkpoint's trained block size. Keep TP/PP/DP/CP=1. Context anchor storage
+is a nonpersistent model buffer, moved with the model and stable during replay.
+
+Before deployment compare the same requests with NONE, Target FULL + Draft
+eager, and both FULL. Warm up separately, disable profiling for timing, compare
+output tokens/logits, acceptance, EOS and repeated request-slot reuse. Measure
+prefill and decode separately. Graph capture succeeding is not performance or
+correctness acceptance.
+
+`tests/v1/spec_decode/test_mmuse_greedy_graph.py` covers independent query layout,
+rejection, null blocks, shrinking/reordered batches and compilation isolation.
+`test_mmuse_rollout_graph.py` exercises the real prediction runtime with synthetic
+weights, including native CUDA/NPU capture when hardware is available. Ascend's
+`tests/ut/spec_decode/test_mmuse_greedy_graph.py` covers current-step task resolution
+and capture-context restoration. These tests do not validate paged attention or
+trained-checkpoint quality; full-model GPU/NPU acceptance is still required.
 
 ## Environment and launch template
 
