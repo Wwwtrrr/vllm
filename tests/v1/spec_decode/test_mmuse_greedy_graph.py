@@ -57,7 +57,10 @@ def query_device(request):
         yield device
 
 
-def test_query_layout_rejects_suffix_and_preserves_batch_to_state_mapping(query_device):
+@pytest.mark.parametrize("column_sampled", [False, True])
+def test_query_layout_rejects_suffix_and_preserves_batch_to_state_mapping(
+    query_device, column_sampled
+):
     buffers = NS(
         input_ids=torch.full((12,), 999),
         positions=torch.full((12,), 999),
@@ -80,6 +83,8 @@ def test_query_layout_rejects_suffix_and_preserves_batch_to_state_mapping(query_
         torch.tensor([70, 80, 90]),
         torch.tensor([[7, 8, 9]]),
     )
+    if column_sampled:
+        args = (*args[:2], args[2].reshape(-1, 1), args[3])
     prepare(
         buffers, batch, *args, contexts, context_slots, queries, table, 4, 3, 99, 128
     )

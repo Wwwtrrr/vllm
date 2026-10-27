@@ -31,8 +31,11 @@ def prepare_mmuse_inputs(
     last_positions = batch.positions[(ends - 1).clamp_min(0).long()]
     offsets = torch.arange(block_length, device=last_positions.device)
     positions = last_positions[:, None] + 1 + offsets
-    prefill = next_prefill_tokens.reshape(-1, last_sampled.numel())[0]
-    anchors = torch.where(num_sampled[:count] > 0, last_sampled[state], prefill[state])
+    # RequestState stores last_sampled_tokens as [capacity, 1]. Flatten
+    # before gathering, otherwise where([N], [N, 1], [N]) broadcasts to [N, N].
+    sampled = last_sampled.reshape(-1)
+    prefill = next_prefill_tokens.reshape(-1, sampled.numel())[0]
+    anchors = torch.where(num_sampled[:count] > 0, sampled[state], prefill[state])
     ids = buffers.input_ids[: count * block_length].view(count, block_length)
     ids.fill_(mask_token_id)
     ids[:, 0].copy_(anchors)
