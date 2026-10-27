@@ -11,29 +11,53 @@ class VerifiedPrefix:
         self.capacity = capacity
         self.storage = storage
         self.requests = {}
+        self.spans = {}
 
-    def append(self, slot, request_id, positions, values):
-        first, end = positions[0].item(), positions[-1].item() + 1
-        if not torch.equal(
-            positions, torch.arange(first, end, device=positions.device)
-        ):
+    def append(self, slot, request_id, positions, values, *, positions_cpu=None):
+        # FULL callers transfer all request metadata once and supply the CPU
+        # positions from that same snapshot. Eager callers keep validation here.
+        if positions_cpu is None:
+            first, end = positions[0].item(), positions[-1].item() + 1
+            contiguous = torch.equal(
+                positions, torch.arange(first, end, device=positions.device)
+            )
+        else:
+            if len(positions_cpu) != positions.numel() or not positions_cpu:
+                raise ValueError("MMuse target positions must be nonempty")
+            first, end = positions_cpu[0], positions_cpu[-1] + 1
+            contiguous = positions_cpu == list(range(first, end))
+        if not contiguous:
             raise ValueError("MMuse target positions must be contiguous")
         previous = self.requests.get(slot)
+        keep_count = 0
         if first == 0:
             old_positions, old_values = positions[:0], values[:0]
         else:
             if previous is None or previous[0] != request_id:
                 raise ValueError("MMuse request is missing its verified prefix")
             _, old_positions, old_values = previous
-            keep = old_positions < first
-            old_positions, old_values = old_positions[keep], old_values[keep]
-            if not old_positions.numel() or old_positions[-1].item() != first - 1:
+            _, old_start, old_end, _ = self.spans[slot]
+            keep_count = min(old_end - old_start, max(0, first - old_start))
+            if not keep_count or old_start + keep_count != first:
                 raise ValueError("MMuse verified prefix has a gap")
-        joined = torch.cat((old_values, values))[-self.capacity :]
-        joined_positions = torch.cat((old_positions, positions))[-self.capacity :]
-        owned = self.storage[slot, : joined.shape[0]]
-        owned.copy_(joined)
+        length = min(self.capacity, keep_count + values.shape[0])
+        evict = max(0, keep_count + values.shape[0] - self.capacity)
+        retained = max(0, keep_count - evict)
+        incoming = values[max(0, evict - keep_count) :]
+        if (
+            incoming.untyped_storage().data_ptr()
+            == self.storage.untyped_storage().data_ptr()
+        ):
+            incoming = incoming.clone()
+        owned = self.storage[slot, :length]
+        if retained and evict:
+            owned[:retained].copy_(old_values[evict:keep_count].clone())
+        owned[retained:].copy_(incoming)
+        joined_positions = torch.arange(
+            end - length, end, device=positions.device, dtype=positions.dtype
+        )
         self.requests[slot] = (request_id, joined_positions, owned)
+        self.spans[slot] = (request_id, end - length, end, first)
         return joined_positions, owned
 
 

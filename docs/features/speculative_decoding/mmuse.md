@@ -69,9 +69,9 @@ The Draft configuration disables Dynamo compilation on a copy and clears the
 Target quantizer. It does not change Target compilation or quantization.
 
 Confirmed history update, feature projection, context normalization and K/V
-projection run outside capture. The initial implementation deliberately retains
-the reference history's CPU reads and request-ID checks. It does not claim to
-remove their synchronization cost. Context capacities use powers of two from
+projection run outside capture. FULL takes one device-to-host metadata snapshot
+per proposal, retaining request-ID and contiguous-position validation. Confirmed
+feature history updates its reserved storage in place. Context capacities use powers of two from
 128 up to the reserved history capacity, including a final non-power-of-two
 capacity when necessary. Negative context positions identify padding; both full
 and sliding attention mask them. Query anchor conditioning gathers the last
@@ -116,8 +116,14 @@ disabled for this new path; it remains available for eager Draft execution.
 Extra buffers per TP rank include approximately
 `(capacity * hidden_size + 2 * layers * capacity * kv_heads * head_dim) * dtype_bytes`,
 in addition to the existing per-request feature history and native graph
-workspaces. Padding and repeated context projection may reduce performance.
-This is not incremental context-KV reuse and does not guarantee acceleration.
+workspaces. The shared buffers cache the last active request's normalized context
+and context K/V: only newly confirmed or overwritten rows are projected, and a
+sliding prefix moves within existing storage. A request/slot change recomputes
+valid context rows. Padding is zeroed without projection. This avoids allocating
+a separate K/V cache for every request, but alternating requests do not benefit
+from incremental reuse. Padding in captured query attention, the remaining
+metadata synchronization and Python request processing may still limit speed.
+Native device validation and throughput measurements remain required.
 
 CPU tests cover padded/unpadded decoder parity, mixed full/sliding layers,
 convolution, context anchor conditioning, overwritten contexts and independent

@@ -55,6 +55,8 @@ class DeepseekMMuseGraphs:
         self.sizes = (*sizes, capacity)
         self.graphs = {}
         self.pool = None
+        self.context_entry = None
+        self.query_offsets = torch.arange(block_size, device=device)
 
     def bucket(self, length):
         if not 0 < length <= self.context.shape[0]:
@@ -93,28 +95,65 @@ class DeepseekMMuseGraphs:
         self.output.copy_(tokens[0])
 
     @torch.inference_mode()
-    def prepare(self, context_positions, features, anchor, slot):
+    def prepare(
+        self,
+        context_positions,
+        features,
+        anchor,
+        slot,
+        *,
+        request_id=None,
+        start=None,
+        end=None,
+        update_start=None,
+    ):
         length = features.shape[0]
         size = self.bucket(length)
-        self.context.zero_()
-        self.context[:length].copy_(self.model.hidden_norm(features))
-        self.context_positions.fill_(-1)
+        known_span = (
+            request_id is not None
+            and start is not None
+            and end is not None
+            and update_start is not None
+        )
+        if known_span and (end - start != length or not start <= update_start <= end):
+            raise ValueError("Invalid DeepSeek MMuse context update span")
+        reused, shift = 0, 0
+        previous = self.context_entry
+        # Invalidate before launching writes; a failed prepare must never leave
+        # cache metadata claiming a partially overwritten context is reusable.
+        self.context_entry = None
+        if known_span and previous is not None:
+            old_slot, old_request, old_start, old_end = previous
+            if (slot, request_id) == (
+                old_slot,
+                old_request,
+            ) and old_start <= start < old_end:
+                reused = max(0, min(old_end, update_start, end) - start)
+                shift = start - old_start
+        if reused and shift:
+            self.context[:reused].copy_(self.context[shift : shift + reused].clone())
+            for storage in self.context_kv:
+                storage[:, :reused].copy_(storage[:, shift : shift + reused].clone())
+        if reused < length:
+            self.context[reused:length].copy_(self.model.hidden_norm(features[reused:]))
+        self.context[length:size].zero_()
+        self.context_positions[:size].fill_(-1)
         self.context_positions[:length].copy_(context_positions)
         self.anchor_index.fill_(length - 1)
         self.input_ids.fill_(self.model.config.mask_token_id)
         self.input_ids[:1].copy_(anchor.reshape(1))
-        self.positions.copy_(
-            context_positions[-1]
-            + 1
-            + torch.arange(self.block_size, device=features.device)
-        )
+        self.positions.copy_(context_positions[-1] + 1 + self.query_offsets)
         self.request_slot.fill_(slot)
         for layer, storage in zip(self.model.layers, self.context_kv):
-            key, value = layer.self_attn.project_kv(
-                self.context[:size], self.context_positions[:size]
-            )
-            storage[0, :size].copy_(key)
-            storage[1, :size].copy_(value)
+            if reused < length:
+                key, value = layer.self_attn.project_kv(
+                    self.context[reused:length], self.context_positions[reused:length]
+                )
+                storage[0, reused:length].copy_(key)
+                storage[1, reused:length].copy_(value)
+            storage[:, length:size].zero_()
+        if known_span:
+            self.context_entry = (slot, request_id, start, end)
         return size
 
     @torch.inference_mode()
@@ -122,6 +161,7 @@ class DeepseekMMuseGraphs:
         if self.graphs:
             raise RuntimeError("DeepSeek MMuse graphs were already captured")
         self.pool = self.backend.graph_pool_handle()
+        self.context_entry = None
         self.request_slot.fill_(-1)
         self.context.zero_()
         self.context_positions.fill_(-1)

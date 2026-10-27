@@ -135,11 +135,28 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
         if not count:
             return self.draft_tokens[:0]
         projected = self._project_target_features(input_batch, aux_hidden_states, False)
-        starts = input_batch.query_start_loc[:count].tolist()
-        ends = (
-            input_batch.query_start_loc[1 : count + 1] - num_rejected[:count]
+        # One device-to-host snapshot instead of per-field/per-request reads.
+        token_count = (
+            int(input_batch.query_start_loc_np[count])
+            if hasattr(input_batch, "query_start_loc_np")
+            else input_batch.positions.numel()
+        )
+        metadata = torch.cat(
+            (
+                input_batch.query_start_loc[:count].long(),
+                (
+                    input_batch.query_start_loc[1 : count + 1] - num_rejected[:count]
+                ).long(),
+                num_sampled[:count].long(),
+                input_batch.positions[:token_count].long(),
+            )
         ).tolist()
-        sampled = num_sampled[:count].tolist()
+        starts, ends, sampled = (
+            metadata[:count],
+            metadata[count : 2 * count],
+            metadata[2 * count : 3 * count],
+        )
+        positions_cpu = metadata[3 * count :]
         self.temperature.copy_(temperature)
         self.seeds.copy_(seeds)
         self.model.history.storage = self.model.feature_storage
@@ -153,11 +170,24 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
                 input_batch.req_ids[row],
                 input_batch.positions[start:end],
                 projected[start:end],
+                positions_cpu=positions_cpu[start:end],
             )
             anchor = (
                 last_sampled[slot] if sampled[row] else next_prefill_tokens[0, slot]
             )
-            size = self.fixed_graphs.prepare(positions, features, anchor, slot)
+            request, context_start, context_end, update_start = (
+                self.model.history.spans[slot]
+            )
+            size = self.fixed_graphs.prepare(
+                positions,
+                features,
+                anchor,
+                slot,
+                request_id=request,
+                start=context_start,
+                end=context_end,
+                update_start=max(context_start, update_start),
+            )
             self.query_cudagraph_manager.replay(size)
             # Copy before the next request overwrites shared graph buffers.
             self.draft_tokens[row].copy_(self.fixed_graphs.output)

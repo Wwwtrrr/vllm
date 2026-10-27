@@ -125,6 +125,9 @@ def test_cached_context_matches_recompute_after_window_rejection_and_slot_reuse(
         ]
     ).to(dtype=dtype)
     capacity = window or 16
+    for layer in layers:
+        for conv in (layer.attention_conv, layer.mlp_conv):
+            torch.nn.init.normal_(conv.base_kernel, std=0.1)
     storage = torch.empty(2, 2, 2, capacity, 1, 4, dtype=dtype)
     owner = SimpleNamespace(
         hidden_norm=decoder.RMS(8, 1e-6).to(dtype=dtype),
@@ -179,6 +182,34 @@ def test_cached_context_matches_recompute_after_window_rejection_and_slot_reuse(
     assert owner.context_kv_cache.entries[0][0] == "new"
     for handle in handles:
         handle.remove()
+
+
+def test_verified_prefix_cpu_metadata_matches_concatenation():
+    storage = torch.zeros(2, 5, 3)
+    history = module("context").VerifiedPrefix(5, storage)
+    previous = None
+    for request, start, end in [
+        ("a", 0, 3),
+        ("a", 3, 7),
+        ("a", 5, 8),
+        ("a", 8, 18),
+        ("new", 0, 2),
+    ]:
+        positions = torch.arange(start, end)
+        values = torch.randn(end - start, 3)
+        if start == 0:
+            expected = values[-5:].clone()
+        else:
+            old_positions, old_values = previous
+            expected = torch.cat((old_values[old_positions < start], values))[-5:]
+        actual_positions, actual = history.append(
+            0, request, positions, values, positions_cpu=positions.tolist()
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(
+            actual_positions, torch.arange(end - len(expected), end)
+        )
+        previous = actual_positions.clone(), actual.clone()
 
 
 def test_context_kv_cache_failure_invalidates_previous_entry():

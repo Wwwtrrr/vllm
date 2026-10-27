@@ -104,7 +104,72 @@ def model(device, dtype, windows, monkeypatch):
         ]
     )
     obj.context_kv_cache = None
+    for layer in obj.layers:
+        for conv in (layer.attention_conv, layer.mlp_conv):
+            torch.nn.init.normal_(conv.base_kernel, std=0.1)
     return obj.eval().to(device=device, dtype=dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_incremental_context_projects_only_changed_rows(dtype, monkeypatch):
+    torch.manual_seed(17)
+    owner = model("cpu", dtype, (4, None), monkeypatch)
+    graph = pure_module("deepseek_graph").DeepseekMMuseGraphs
+    args = (
+        owner,
+        3,
+        None,
+        None,
+        torch.zeros(2),
+        torch.zeros(2, dtype=torch.long),
+        False,
+        None,
+    )
+    incremental, reference = graph(*args), graph(*args)
+    features = torch.randn(30, 16, dtype=dtype)
+    rows = []
+    hook = owner.layers[0].self_attn.k_proj.register_forward_pre_hook(
+        lambda _module, args: rows.append(args[0].shape[0])
+    )
+    # Append, eviction, corrected suffix, rollback, slot switch and slot reuse.
+    rounds = [
+        (0, "a", 0, 5, 0, 5),
+        (0, "a", 0, 9, 5, 4),
+        (0, "a", 2, 18, 9, 9),
+        (0, "a", 2, 18, 14, 4),
+        (0, "a", 2, 8, 8, 0),
+        (1, "b", 0, 4, 0, 4),
+        (0, "new", 0, 5, 0, 5),
+    ]
+    try:
+        for slot, request, start, end, update, expected_rows in rounds:
+            features[update:end] += 0.1
+            positions = torch.arange(start, end)
+            values = features[start:end]
+            rows.clear()
+            size = incremental.prepare(
+                positions,
+                values,
+                torch.tensor([7]),
+                slot,
+                request_id=request,
+                start=start,
+                end=end,
+                update_start=update,
+            )
+            assert rows == ([expected_rows] if expected_rows else [])
+            reference.prepare(positions, values, torch.tensor([7]), slot)
+            tolerance = 0.03 if dtype == torch.bfloat16 else 2e-6
+            for actual, expected in zip(incremental.context_kv, reference.context_kv):
+                torch.testing.assert_close(
+                    actual[:, :size], expected[:, :size], atol=tolerance, rtol=tolerance
+                )
+            incremental.forward(size)
+            reference.forward(size)
+            torch.testing.assert_close(incremental.output, reference.output)
+    finally:
+        hook.remove()
 
 
 @pytest.mark.parametrize("windows", [(None, None), (4, 4), (4, None)])
