@@ -267,6 +267,40 @@ class DeepseekMMuseReference(nn.Module):
             cache.commit(cache_slot, request_id, start, end)
         return output
 
+    def forward_fixed_context(
+        self,
+        input_ids,
+        positions,
+        context_positions,
+        normalized_context,
+        context_kv,
+        anchor_index,
+    ):
+        """Query-only forward over padded, immutable-shape context buffers.
+
+        The caller normalizes/projects confirmed context outside capture.
+        Padding positions are -1 and are masked by BlockAttention.
+        """
+        hidden = F.embedding(input_ids, self.embedding_weight)
+        if self.runtime.block_position_embedding is not None:
+            hidden = hidden + self.runtime.block_position_embedding(
+                torch.arange(input_ids.numel(), device=input_ids.device)
+            )
+        if self.runtime.context_hidden_proj is not None:
+            anchor = normalized_context.index_select(0, anchor_index)
+            hidden = hidden + torch.tanh(
+                self.runtime.context_hidden_gate
+            ) * self.runtime.context_hidden_proj(anchor)
+        for layer, kv in zip(self.layers, context_kv):
+            hidden = layer(
+                hidden,
+                normalized_context,
+                positions,
+                context_positions,
+                context_kv=kv,
+            )
+        return self.norm(hidden)
+
     def load_weights(self, weights):
         parameters = dict(self.named_parameters())
         loaded = set()

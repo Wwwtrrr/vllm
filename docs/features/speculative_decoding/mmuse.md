@@ -49,11 +49,92 @@ is a correctness reference, not a throughput optimization. Target backbone
 quantization remains the backend's responsibility. Interface checks do not prove
 that the serving Target weights match the training teacher numerically.
 
-Require BF16 activations, an unquantized draft, eager Target and Draft,
+Require BF16 activations, an unquantized draft,
 `enable_prefix_caching=False`, and PP/DP/context parallel sizes of one. Target TP
 may exceed one; Draft computation is replicated. Adaptive verification,
-watermarking and local argmax reduction are rejected. FULL graphs are not
-implemented for this path.
+watermarking and local argmax reduction are rejected. Eager remains the
+reference path; the optional FULL query path is described below.
+
+### DeepSeek MMuse FULL query graphs
+
+Target retains the existing DeepSeek/Ascend FULL graph path, including W4A8
+quantization and attention/cache handling. With Draft `enforce_eager=True`,
+`MMuseReferenceSpeculator` remains eager and can consume graph-produced Target
+features. With Draft `enforce_eager=False`, Model Runner V2 selects
+`DeepseekMMuseFullSpeculator` / `AscendDeepseekMMuseFullSpeculator`.
+
+The new path reuses the reference model, trained teacher IO and QuaRot binding.
+Declared rotations are still undone in FP32 before feature normalization/fusion.
+The Draft configuration disables Dynamo compilation on a copy and clears the
+Target quantizer. It does not change Target compilation or quantization.
+
+Confirmed history update, feature projection, context normalization and K/V
+projection run outside capture. The initial implementation deliberately retains
+the reference history's CPU reads and request-ID checks. It does not claim to
+remove their synchronization cost. Context capacities use powers of two from
+128 up to the reserved history capacity, including a final non-power-of-two
+capacity when necessary. Negative context positions identify padding; both full
+and sliding attention mask them. Query anchor conditioning gathers the last
+valid context row instead of the end of the padded buffer.
+
+Each native CUDA/NPU graph captures one K-token query decoder and complete MMuse
+rollout, including native probability sampling and logits writes when selected.
+Requests replay serially through stable input/context buffers; output is copied
+before the next request reuses them. There is no Draft paged attention layer and
+no Draft updatable-attention task: native Torch operators use fixed shapes.
+Target graph updates are unchanged. Native graph ownership participates in the
+runner's memory-profiling cleanup so profiling captures are not retained.
+
+For a K=7 checkpoint, preserve the working W4A8 Target settings and use:
+
+```python
+enforce_eager = False  # Target
+enable_prefix_caching = False
+speculative_config = {
+    "method": "mmuse",
+    "model": "/path/to/deepseek-v4-flash-mmuse",
+    "num_speculative_tokens": 7,
+    "enforce_eager": False,
+    "draft_sample_method": "greedy",  # Or "probabilistic".
+}
+compilation_config = {
+    "cudagraph_mode": "FULL",
+    "cudagraph_capture_sizes": [8],  # Target BS1 verify shape; BS4 also needs 32.
+}
+```
+
+Preserve the baseline Target's compilation mode and other compilation settings;
+the example only shows the FULL mode and verification size. Retain smaller
+Target capture sizes needed by the workload, including prefill.
+Draft capture shapes are context buckets with one complete K-token query, not
+the Target token-size list. Probabilistic mode uses request seeds, temperatures
+and absolute query positions, with pre-temperature logits cached by persistent
+request slot. Capture uses slot -1 and does not write live probability caches.
+NPU FP64 Gumbel is rejected. The older optional `mmuse_draft_kv_reuse` must be
+disabled for this new path; it remains available for eager Draft execution.
+
+Extra buffers per TP rank include approximately
+`(capacity * hidden_size + 2 * layers * capacity * kv_heads * head_dim) * dtype_bytes`,
+in addition to the existing per-request feature history and native graph
+workspaces. Padding and repeated context projection may reduce performance.
+This is not incremental context-KV reuse and does not guarantee acceleration.
+
+CPU tests cover padded/unpadded decoder parity, mixed full/sliding layers,
+convolution, context anchor conditioning, overwritten contexts and independent
+request outputs. Optional native tests capture decoder plus real MMuse heads and
+sampling, changing context lengths, seeds and request slots across replays:
+
+```bash
+pytest --noconftest --import-mode=importlib tests/v1/spec_decode/test_mmuse_deepseek_graph.py -q
+```
+
+These synthetic tests do not validate the W4A8 Target or TP serving. On the
+server compare Eager/Eager, Target FULL/Draft Eager, then FULL/FULL using the same
+checkpoint, requests and TP layout. Check mean-HC layer IDs/order, live auxiliary
+features, QuaRot alignment, rejection rollback, EOS and reused request slots.
+Only after correctness checks measure unprofiled steady-state throughput and
+memory. Existing DSpark FULL success is the Target execution baseline, not proof
+of MMuse feature or probability correctness.
 
 ### Optional confirmed-context KV reuse
 

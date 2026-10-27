@@ -23,10 +23,6 @@ def validate_deepseek_export(config, source):
         raise ValueError("DeepSeek MMuse auxiliary IDs must precede the teacher slot")
     if ids != sorted(set(ids)):
         raise ValueError("DeepSeek MMuse auxiliary IDs must be unique and ascending")
-    if not target.enforce_eager or not spec.enforce_eager:
-        raise ValueError(
-            "DeepSeek MMuse reference execution requires both models eager"
-        )
     if target.dtype != torch.bfloat16 or spec.draft_model_config.quantization:
         raise ValueError(
             "DeepSeek MMuse requires BF16 activations and an unquantized draft"

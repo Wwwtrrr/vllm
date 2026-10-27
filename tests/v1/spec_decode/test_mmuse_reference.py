@@ -191,7 +191,7 @@ def test_context_kv_cache_failure_invalidates_previous_entry():
 
 
 @pytest.mark.parametrize(
-    "bad", [None, "eager", "prefix", "teacher", "order", "geometry", "contract"]
+    "bad", [None, "full", "prefix", "teacher", "order", "geometry", "contract"]
 )
 def test_training_contract_rejects_incompatible_serving_inputs(bad):
     decoder = dict(
@@ -229,8 +229,9 @@ def test_training_contract_rejects_incompatible_serving_inputs(bad):
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         parallel_config=SimpleNamespace(),
     )
-    if bad == "eager":
+    if bad == "full":
         target.enforce_eager = False
+        spec.enforce_eager = False
     elif bad == "prefix":
         config.cache_config.enable_prefix_caching = True
     elif bad == "teacher":
@@ -242,7 +243,7 @@ def test_training_contract_rejects_incompatible_serving_inputs(bad):
     elif bad == "contract":
         source["target_training_contract"] = {}
     validate = module("deepseek_contract").validate_deepseek_export
-    if bad is None:
+    if bad in (None, "full"):
         validate(config, source)
     else:
         with pytest.raises(ValueError):
