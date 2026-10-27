@@ -74,8 +74,6 @@ def _validate_qwen3_sampling(config, source) -> None:
     """Check probabilistic sampling and its logits-cache contract."""
     spec = config.speculative_config
     if spec.draft_sample_method == "probabilistic":
-        if not config.model_config.enforce_eager or not spec.enforce_eager:
-            raise ValueError("MMuse probabilistic drafting requires enforce_eager=True")
         if getattr(config, "watermark_config", None) is not None:
             raise ValueError(
                 "MMuse probabilistic drafting does not support watermarking"

@@ -126,6 +126,8 @@ def test_query_layout_rejects_suffix_and_preserves_batch_to_state_mapping(
 
 def test_draft_compilation_choice_does_not_mutate_target_config():
     class Base:
+        draft_sample_method = "greedy"
+
         def __init__(self, config, device):
             self.vllm_config = config
             self.num_speculative_steps = 3
@@ -202,6 +204,9 @@ def test_query_forward_includes_rollout_and_writes_persistent_tokens():
         vllm_config=None,
         query_context=nullcontext,
     )
+    proposer.rollout_queries = lambda block, anchors: proposer.model.rollout_mmuse(
+        block, anchors
+    )
     forward = method(
         "forward_queries",
         set_forward_context=lambda *a, **k: nullcontext(),
@@ -267,6 +272,7 @@ def test_proposal_precomputes_confirmed_context_before_replay(use_graph):
             kernel_block_sizes=[4],
         ),
     )
+    proposer.prepare_sampling = lambda *args: None
 
     def eager(count, total, meta, slots):
         events.append("eager")

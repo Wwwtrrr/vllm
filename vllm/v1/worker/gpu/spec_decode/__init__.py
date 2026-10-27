@@ -21,9 +21,11 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
             )
 
             return MMuseGreedySpeculator(vllm_config, device)
-        from vllm.v1.worker.gpu.spec_decode.mmuse.speculator import MMuseSpeculator
+        from vllm.v1.worker.gpu.spec_decode.mmuse.probabilistic import (
+            MMuseProbabilisticSpeculator,
+        )
 
-        return MMuseSpeculator(vllm_config, device)
+        return MMuseProbabilisticSpeculator(vllm_config, device)
     if speculative_config.method == "extract_hidden_states":
         from vllm.v1.worker.gpu.spec_decode.extract_hidden_states import (
             ExtractHiddenStatesSpeculator,

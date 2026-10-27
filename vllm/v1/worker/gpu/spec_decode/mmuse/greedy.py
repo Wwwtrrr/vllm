@@ -35,7 +35,7 @@ logger = init_logger(__name__)
 
 
 class MMuseGraphManager(CudaGraphManager):
-    """Capture query decoder plus the complete greedy MMuse rollout.
+    """Capture query decoder plus the complete MMuse rollout.
 
     Context K/V projection stays outside the graph, including for long prefills.
     Only persistent query buffers and the output token buffer cross replay.
@@ -48,6 +48,7 @@ class MMuseGraphManager(CudaGraphManager):
             batch = InputBatch.make_dummy(
                 count, desc.num_tokens, proposer.input_buffers
             )
+            proposer.reset_sampling()
             tables = proposer.block_tables.get_dummy_block_tables(count)
             slots = proposer.block_tables.get_dummy_slot_mappings(desc.num_tokens)
             metadata = proposer.capture_metadata(
@@ -71,7 +72,7 @@ class MMuseGraphManager(CudaGraphManager):
                 count, desc.num_tokens, metadata, by_layer
             )
 
-        super().capture(prepare, "Capturing MMuse query and greedy rollout")
+        super().capture(prepare, "Capturing MMuse query and rollout")
 
 
 class MMuseGreedySpeculator(DraftModelSpeculator):
@@ -79,14 +80,15 @@ class MMuseGreedySpeculator(DraftModelSpeculator):
 
     graph_manager_cls = MMuseGraphManager
     capture_metadata = staticmethod(build_attn_metadata)
+    draft_sample_method = "greedy"
 
     def __init__(self, vllm_config, device):
         validate_mmuse_config(vllm_config)
         spec = vllm_config.speculative_config
         source = spec.draft_model_config.hf_config.mmuse_source_config
-        if spec.draft_sample_method != "greedy":
+        if spec.draft_sample_method != self.draft_sample_method:
             raise ValueError(
-                "The independent MMuse graph path requires greedy drafting"
+                f"This MMuse proposer requires {self.draft_sample_method} drafting"
             )
         if spec.num_speculative_tokens != source["block_size"]:
             raise ValueError("MMuse query length must equal the trained block_size")
@@ -187,9 +189,11 @@ class MMuseGreedySpeculator(DraftModelSpeculator):
                 "num_speculative_tokens in the capture sizes"
             )
         logger.info(
-            "Independent MMuse draft: graph=%s, query length=%d, torch.compile=NONE",
+            "Independent MMuse draft: graph=%s, query length=%d, "
+            "sampling=%s, torch.compile=NONE",
             mode.name,
             self.num_query_per_req,
+            self.draft_sample_method,
         )
 
     def capture(self):
@@ -201,6 +205,15 @@ class MMuseGreedySpeculator(DraftModelSpeculator):
 
     def query_context(self):
         return nullcontext()
+
+    def reset_sampling(self):
+        """Platform-independent capture hook; greedy has no sampling state."""
+
+    def prepare_sampling(self, batch, num_rejected, temperature, seeds, dummy_run):
+        """Publish per-request state before replay; greedy needs none."""
+
+    def rollout_queries(self, block, anchors):
+        return self.model.rollout_mmuse(block, anchors)
 
     def build_query_metadata(self, batch, desc):
         metadata = self._build_uniform_attn_metadata(
@@ -234,7 +247,7 @@ class MMuseGreedySpeculator(DraftModelSpeculator):
             )
         block = hidden.reshape(count, self.num_query_per_req, -1)
         anchors = self.input_buffers.input_ids[: total : self.num_query_per_req]
-        tokens, _ = self.model.rollout_mmuse(block, anchors)
+        tokens, _ = self.rollout_queries(block, anchors)
         self.draft_tokens[:count].copy_(tokens)
 
     @torch.inference_mode()
@@ -260,6 +273,7 @@ class MMuseGreedySpeculator(DraftModelSpeculator):
         count, total = input_batch.num_reqs, input_batch.num_tokens
         if count == 0:
             return self.draft_tokens[:0]
+        self.prepare_sampling(input_batch, num_rejected, temperature, seeds, dummy_run)
         query_total = count * self.num_query_per_req
         hidden = (
             self.model.combine_hidden_states(torch.cat(aux_hidden_states, -1))

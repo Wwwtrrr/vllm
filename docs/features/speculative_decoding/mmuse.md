@@ -125,7 +125,7 @@ do not establish end-to-end correctness or speedup.
 - `sample_from_anchor=True`, full-attention draft layers, enabled Correction.
 - Fixed proposal length equal to the trained block size (typically 7).
 - Greedy proposals with eager or FULL query execution, one device.
-- Probabilistic draft proposals require eager execution for Target and Draft.
+- Probabilistic proposals with eager or FULL query execution, one device.
 - No quantization, watermarking or adaptive verification.
 
 These are implementation limits; commenting out a configuration check does not
@@ -152,9 +152,10 @@ validate this extension.
 Greedy Qwen3 uses `MMuseGreedySpeculator`, directly derived from the generic
 `DraftModelSpeculator`. Ascend uses `AscendMMuseGreedySpeculator` and its own
 `MMuseAclGraphManager`. Input preparation, model loading and graph capture do
-not call the DFlash proposer or DFlash graph managers. Probabilistic eager
-execution retains the previous `MMuseSpeculator` / `AscendMMuseSpeculator`
-implementation and its DFlash context execution.
+not call the DFlash proposer or DFlash graph managers. Probabilistic execution
+selects `MMuseProbabilisticSpeculator` / `AscendMMuseProbabilisticSpeculator`.
+These extend our independent query engine and graph managers with request-scoped
+sampling buffers; they do not inherit the DFlash proposer.
 
 `MMuseQwen3ForCausalLM` uses native vLLM Qwen3/DFlash Attention and projections.
 Its decoder wraps Attention and MLP with the source dynamic convolution, preserving
@@ -176,7 +177,7 @@ weights are intentionally taken from the target; this is distinct from missing
 trained draft parameters. Confidence weights are loaded but are not used for
 adaptive proposal length in this first version.
 
-### Qwen3 greedy FULL graph boundary
+### Qwen3 FULL graph boundary
 
 Target uses the framework's original model graph manager. This adapter does not
 change Target attention, capture sizes, synchronization or graph-update ordering.
@@ -189,7 +190,7 @@ Draft has an independent capture lifecycle:
 3. Project and store confirmed context K/V outside the graph. Long prefill
    contexts follow the same path as decode context.
 4. Build current-step query attention metadata once.
-5. Replay query decoder, complete greedy Correction/Selector/Markov rollout and
+5. Replay query decoder, complete Correction/Selector/Markov rollout and
    output-buffer write together. Shapes absent from the capture set run eagerly.
 
 Thus FULL covers the draft query forward and rollout, not the whole proposal
@@ -243,6 +244,48 @@ weights, including native CUDA/NPU capture when hardware is available. Ascend's
 `tests/ut/spec_decode/test_mmuse_greedy_graph.py` covers current-step task resolution
 and capture-context restoration. These tests do not validate paged attention or
 trained-checkpoint quality; full-model GPU/NPU acceptance is still required.
+
+### Probabilistic FULL execution
+
+Use the FULL configuration above and explicitly change
+`speculative_config["draft_sample_method"] = "probabilistic"`. Both Target and
+Draft may have `enforce_eager=False`; Target uses its native FULL graph path.
+Begin with request `temperature=0.7`, `top_p=1.0`, `top_k=-1`, repetition penalty
+1 and a fixed request seed. Draft retains temperature-only proposal sampling;
+Target retains its normal processing.
+
+The probability extension captures native Gumbel sampling, final-logit cache
+writes and sampled-token feedback together with the MMuse rollout. Request
+mapping, seeds, temperatures and absolute positions are updated in persistent
+buffers before replay. A query at P predicts token P+1, so its random key uses
+P plus the native draft-stream salt. Random state is not frozen at capture
+time; repeating the same seed and position intentionally reproduces the draw.
+
+Cache storage is `[max_num_seqs, K, vocab_size]`, in the verifier's head dtype.
+Sampling first casts logits to this same precision, then caches them before
+temperature scaling. Only live request slots may be written. Capture, dummy
+execution and padded rows use state index -1, leaving other requests' caches
+unchanged. Zero-temperature requests use argmax within mixed batches.
+NPU rejects FP64 Gumbel explicitly. Adaptive verification, dynamic proposal
+lengths and watermarking remain unsupported.
+
+`test_mmuse_probabilistic_graph.py` covers slot remapping, rejection-adjusted
+positions, cache precision and inactive rows. Optional CUDA/NPU cases capture
+real MMuse heads and the native sampler with synthetic weights, then compare
+replay against eager execution while changing seeds, anchors, features and
+request occupancy. Run from the vLLM repository in the matching backend
+environment:
+
+```bash
+pytest --noconftest --import-mode=importlib tests/v1/spec_decode/test_mmuse_probabilistic_graph.py -q
+```
+
+These checks do not execute full-model paged attention or Target rejection.
+Before claiming correctness or speedup, compare the trained checkpoint with
+NONE, Target FULL + eager Draft, and both FULL. Check multi-round verification,
+first/middle rejection, EOS, reused request slots and output distributions at
+nonzero temperature. GPU and NPU need not produce identical random streams.
+Measure steady-state throughput without profiling after a separate warmup.
 
 ## Environment and launch template
 
