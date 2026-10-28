@@ -423,6 +423,13 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
             online_mask=online_previous_mask,
         )
 
+    def _fused_correction_logits(self, causal_states, base_logits, position):
+        """Add the low-rank residual in the cached base logits' precision."""
+        delta_logits = self.correction_head.fused_lm_head_residual(
+            causal_states, self.lm_head.weight
+        )
+        return base_logits[:, position] + delta_logits[:, 0].to(base_logits.dtype)
+
     def _rollout_correction_step(
         self,
         previous_embeddings: torch.Tensor,
@@ -478,12 +485,8 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                 corrected_current_hidden if project_corrected_hidden else current_hidden
             )
             if project_corrected_hidden and fused_base_logits is not None:
-                hidden_delta_logits = self.correction_head.fused_lm_head_residual(
-                    causal_states,
-                    self.lm_head.weight,
-                )
-                projected_logits = fused_base_logits[:, position] + (
-                    hidden_delta_logits[:, 0].to(fused_base_logits.dtype)
+                projected_logits = self._fused_correction_logits(
+                    causal_states, fused_base_logits, position
                 )
             elif precomputed_base_logits is not None and not project_corrected_hidden:
                 projected_logits = precomputed_base_logits[:, position]
@@ -497,12 +500,8 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                 current_hidden.dtype
             )
             if fused_base_logits is not None:
-                delta_logits = self.correction_head.fused_lm_head_residual(
-                    causal_states,
-                    self.lm_head.weight,
-                )
-                final_logits = fused_base_logits[:, position] + (
-                    delta_logits[:, 0].to(fused_base_logits.dtype)
+                final_logits = self._fused_correction_logits(
+                    causal_states, fused_base_logits, position
                 )
             else:
                 final_logits = self.lm_head(
@@ -617,6 +616,12 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                 fused_base_logits = self.lm_head(
                     dflash_hidden.to(self.lm_head.weight.dtype)
                 )
+        available_base_logits = (
+            fused_base_logits
+            if fused_base_logits is not None
+            else precomputed_base_logits
+        )
+        has_markov_head = getattr(self, "markov_head", None) is not None
         initial_feedback = self._initial_rollout_logit_feedback(
             dflash_hidden,
             initial_previous_logits,
@@ -635,11 +640,6 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
             current_hidden = dflash_hidden[:, position]
             if position < start_position:
                 corrected_current_hidden = current_hidden
-                available_base_logits = (
-                    fused_base_logits
-                    if fused_base_logits is not None
-                    else precomputed_base_logits
-                )
                 if available_base_logits is not None:
                     final_logits = available_base_logits[:, position]
                 else:
@@ -700,7 +700,7 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                 corrected_current_hidden = step.corrected_hidden
                 cache = step.cache
                 del step  # Match the previous tuple-unpacking tensor lifetimes.
-                if getattr(self, "markov_head", None) is not None:
+                if has_markov_head:
                     final_logits, _, _ = self._apply_collaborative_markov(
                         final_logits.unsqueeze(1),
                         causal_states.unsqueeze(1),
@@ -711,17 +711,16 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
 
             with torch.no_grad():
                 if sample_token is not None:
-                    sampled_indices = sample_token(final_logits, position)
+                    draft_ids = sample_token(final_logits, position)
                 elif temperature > 0:
                     probabilities = torch.softmax(
                         final_logits.float() / temperature, dim=-1
                     )
-                    sampled_indices = torch.multinomial(
-                        probabilities, num_samples=1
-                    ).squeeze(-1)
+                    draft_ids = torch.multinomial(probabilities, num_samples=1).squeeze(
+                        -1
+                    )
                 else:
-                    sampled_indices = torch.argmax(final_logits, dim=-1)
-                draft_ids = sampled_indices
+                    draft_ids = torch.argmax(final_logits, dim=-1)
             output_tokens.append(draft_ids)
             output_logits.append(final_logits)
             output_states.append(causal_states)
@@ -738,9 +737,7 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                 hidden_feedback_enabled=hidden_feedback_enabled,
                 correction_head=self.correction_head,
             )
-            if position < start_position:
-                continue
-            if conditioning_previous_ids is None:
+            if position >= start_position and conditioning_previous_ids is None:
                 previous_ids = self._draft_ids_to_verifier(draft_ids)
 
         return CorrectionRolloutOutput(
@@ -763,10 +760,7 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
         base_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply Correction using a static selector path or online feedback."""
-        conditioning_previous_ids = None
-        conditioning_current_ids = None
-        conditioning_previous_rank_features = None
-        conditioning_previous_logits_mask = None
+        selector_inputs = SelectorCorrectionInputs()
         if self.candidate_selector is not None:
             if base_logits is None:
                 base_logits = self.lm_head(dflash_hidden.to(self.lm_head.weight.dtype))
@@ -786,12 +780,6 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                     anchor_token_ids,
                     initial_previous_logits=initial_previous_logits,
                 )
-                conditioning_current_ids = selector_inputs.current_token_ids
-                conditioning_previous_ids = selector_inputs.previous_token_ids
-                conditioning_previous_rank_features = (
-                    selector_inputs.previous_rank_features
-                )
-                conditioning_previous_logits_mask = selector_inputs.previous_logits_mask
         rollout = self._rollout_correction_steps(
             dflash_hidden,
             anchor_token_ids,
@@ -799,10 +787,10 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
             sample_token=sample_token,
             initial_previous_logits=initial_previous_logits,
             precomputed_base_logits=base_logits,
-            conditioning_current_ids=conditioning_current_ids,
-            conditioning_previous_ids=conditioning_previous_ids,
-            conditioning_previous_rank_features=(conditioning_previous_rank_features),
-            conditioning_previous_logits_mask=conditioning_previous_logits_mask,
+            conditioning_current_ids=selector_inputs.current_token_ids,
+            conditioning_previous_ids=selector_inputs.previous_token_ids,
+            conditioning_previous_rank_features=selector_inputs.previous_rank_features,
+            conditioning_previous_logits_mask=selector_inputs.previous_logits_mask,
         )
         return rollout.token_ids, rollout.logits
 

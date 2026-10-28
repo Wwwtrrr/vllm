@@ -419,13 +419,20 @@ checks. Only then measure acceptance length, latency, memory and throughput.
 ## Adapter code layout
 
 - `models/mmuse/validation.py` dispatches model-specific execution checks;
-  `models/mmuse_runtime.py` keeps the public validation import and Qwen3 rollout
-  helpers.
+  `models/mmuse_runtime.py` keeps runtime construction, the public validation
+  import and legacy rollout helpers used by compatibility/parity checks.
+- `worker/gpu/spec_decode/mmuse/greedy.py` and `probabilistic.py` implement the
+  current Qwen3 worker paths. Ascend uses corresponding subclasses. The older
+  DFlash-based `mmuse/speculator.py` classes are retained import entry points;
+  neither worker factory selects them. They are distinct from the checkpoint
+  architecture string `MMuseSpeculator`, which remains a model-registry alias
+  for `MMuseQwen3ForCausalLM` and must not be removed as an unused worker class.
 - `models/mmuse/deepseek_contract.py` validates the DeepSeek training export.
   `models/mmuse/context.py` owns confirmed feature history and optional context
   K/V reuse; the former module retains compatibility imports for these classes.
 - `models/deepseek_mmuse_reference.py` loads trained tensors and binds teacher
   or deployed Target IO without changing checkpoint parameter names.
 - `worker/gpu/spec_decode/mmuse/reference.py` prepares verified context, query
-  blocks and proposals. The Ascend subclass supplies NPU sampling and QuaRot
-  matrix loading.
+  blocks and proposals for eager DeepSeek drafting. `deepseek_full.py` adds its
+  fixed-context graph path. Both support greedy and probabilistic proposals.
+  The Ascend subclasses supply NPU sampling, graph backend and QuaRot binding.

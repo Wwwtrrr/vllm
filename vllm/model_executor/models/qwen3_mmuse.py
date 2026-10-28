@@ -81,21 +81,24 @@ class MMuseQwen3Model(DFlashQwen3Model):
     def forward(self, input_ids, positions, input_embeds=None):
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
-        block = self.config.block_size
-        if input_embeds.shape[0] % block:
+        block_size = self.config.block_size
+        num_query_rows = input_embeds.shape[0]
+        if num_query_rows % block_size:
             raise ValueError("MMuse query rows must contain complete trained blocks")
-        count = input_embeds.shape[0] // block
+        num_requests = num_query_rows // block_size
         runtime = self._runtime_ref()
-        hidden = input_embeds.reshape(count, block, -1)
-        if runtime.block_position_embedding is not None:
-            slots = torch.arange(block, device=hidden.device)
-            hidden = hidden + runtime.block_position_embedding(slots)[None]
-        if runtime.context_hidden_proj is not None:
-            residual = runtime.context_hidden_proj(self.context_anchor[:count])
-            hidden = hidden + (
+        query_hidden = input_embeds.reshape(num_requests, block_size, -1)
+        position_embedding = runtime.block_position_embedding
+        context_projection = runtime.context_hidden_proj
+        if position_embedding is not None:
+            slots = torch.arange(block_size, device=query_hidden.device)
+            query_hidden = query_hidden + position_embedding(slots)[None]
+        if context_projection is not None:
+            residual = context_projection(self.context_anchor[:num_requests])
+            query_hidden = query_hidden + (
                 torch.tanh(runtime.context_hidden_gate) * residual[:, None]
             )
-        return super().forward(input_ids, positions, hidden.flatten(0, 1))
+        return super().forward(input_ids, positions, query_hidden.flatten(0, 1))
 
 
 class _TargetEmbedding(nn.Module):

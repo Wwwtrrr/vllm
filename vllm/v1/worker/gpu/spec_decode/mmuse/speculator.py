@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DFlash context execution with the reference MMuse greedy rollout."""
+"""Legacy DFlash-based MMuse entry point; not selected by the worker factory."""
 
 from vllm.model_executor.models.mmuse_runtime import (
     MMuseGreedyRolloutMixin,

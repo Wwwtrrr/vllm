@@ -13,15 +13,16 @@ from .correction import CorrectionCache
 class SelectorCorrectionInputs(NamedTuple):
     """A static Selector path and its predecessor-distribution features.
 
-    Both ID tensors are verifier-vocabulary IDs [B, T], not draft IDs. Optional
+    When present, ID tensors are verifier-vocabulary IDs [B, T], not draft IDs.
+    An empty instance represents an unconditioned or online-Selector rollout. Optional
     rank features [B, T, R] and their mask [B, T] are supplied together in logits
     mode. The existing producer owns token shifting and gradient boundaries.
     """
 
-    current_token_ids: Tensor
-    previous_token_ids: Tensor
-    previous_rank_features: Tensor | None
-    previous_logits_mask: Tensor | None
+    current_token_ids: Tensor | None = None
+    previous_token_ids: Tensor | None = None
+    previous_rank_features: Tensor | None = None
+    previous_logits_mask: Tensor | None = None
 
 
 class SelectorPreviousCandidates(NamedTuple):
