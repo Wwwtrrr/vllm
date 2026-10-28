@@ -85,21 +85,10 @@ class MMuseGreedySpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config, device):
         validate_mmuse_config(vllm_config)
         spec = vllm_config.speculative_config
-        source = spec.draft_model_config.hf_config.mmuse_source_config
         if spec.draft_sample_method != self.draft_sample_method:
             raise ValueError(
                 f"This MMuse proposer requires {self.draft_sample_method} drafting"
             )
-        if spec.num_speculative_tokens != source["block_size"]:
-            raise ValueError("MMuse query length must equal the trained block_size")
-        if not source.get("sample_from_anchor", True):
-            raise ValueError("MMuse requires sample_from_anchor=True")
-        if spec.enable_adaptive_verification:
-            raise ValueError("MMuse FULL does not support adaptive verification")
-        if spec.uses_dynamic_speculative_decoding():
-            raise ValueError("MMuse requires a fixed trained query block length")
-        if getattr(vllm_config, "watermark_config", None) is not None:
-            raise ValueError("MMuse does not support watermarking")
         # Device graph capture does not require Dynamo compilation. Do not
         # propagate this draft-only choice back into the Target configuration.
         config = copy.copy(vllm_config)

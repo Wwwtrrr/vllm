@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Eager, single-device Qwen3 MMuse adapter with standalone inference heads."""
+"""Single-device Qwen3 MMuse model for eager and native graph execution."""
 
 import weakref
 from collections.abc import Iterable
@@ -140,8 +140,7 @@ class MMuseQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         self._target_weights_bound = False
 
     def combine_hidden_states(self, hidden_states):
-        projection, _ = self.runtime._prepare_target_hidden(hidden_states)
-        return projection
+        return self.runtime._prepare_target_hidden(hidden_states)[0]
 
     def bind_target_weights(self, target_model):
         target = (
@@ -162,20 +161,25 @@ class MMuseQwen3ForCausalLM(DFlashQwen3ForCausalLM):
             hidden, anchor_ids, temperature=0.0, sample_token=sample_token
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        mapped = []
+    @staticmethod
+    def _map_checkpoint_weights(weights: Iterable[tuple[str, torch.Tensor]]):
+        """Route backbone and inference-head weights to their registered modules."""
         for name, weight in weights:
-            if name in ("t2d", "d2t") or name.startswith("verifier_"):
-                continue
-            if name.startswith(("embed_tokens.", "lm_head.")):
-                # Full-vocabulary MMuse always borrows these from the target.
+            if name in ("t2d", "d2t") or name.startswith(
+                ("verifier_", "embed_tokens.", "lm_head.")
+            ):
+                # Full-vocabulary MMuse borrows teacher IO from the Target.
                 continue
             if name.startswith(("layers.", "fc.", "hidden_norm.", "norm.")):
                 name = "model." + name
             else:
                 name = "runtime." + name
-            mapped.append((name, weight))
-        loaded = AutoWeightsLoader(self).load_weights(mapped)
+            yield name, weight
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        loaded = AutoWeightsLoader(self).load_weights(
+            self._map_checkpoint_weights(weights)
+        )
         borrowed = {"model.embed_tokens.weight", "lm_head.weight"}
         initialized = {"model.mask_embedding"}
         missing = {name for name, _ in self.named_parameters()} - loaded

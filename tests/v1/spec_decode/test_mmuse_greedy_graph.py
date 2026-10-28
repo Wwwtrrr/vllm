@@ -181,8 +181,8 @@ def test_draft_compilation_choice_does_not_mutate_target_config():
     assert config.compilation_config.mode == 3
     assert proposer.vllm_config.compilation_config.mode == 0
     assert proposer.vllm_config.compilation_config.cudagraph_mode == "FULL"
-    spec.num_speculative_tokens = 2
-    with pytest.raises(ValueError, match="block_size"):
+    spec.draft_sample_method = "probabilistic"
+    with pytest.raises(ValueError, match="greedy drafting"):
         scope["Proposer"](config, "cpu")
 
 

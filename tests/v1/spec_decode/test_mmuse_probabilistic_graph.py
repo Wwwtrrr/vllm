@@ -138,18 +138,20 @@ def test_probability_constructor_uses_our_query_engine_and_inert_buffers():
 @pytest.mark.parametrize(
     "target_eager,draft_eager", [(False, False), (False, True), (True, True)]
 )
-def test_probability_contract_allows_target_full_and_keeps_sampling_checks(
-    target_eager, draft_eager
+@pytest.mark.parametrize("sampling", ["greedy", "probabilistic"])
+def test_query_contract_allows_target_full_and_keeps_sampling_checks(
+    target_eager, draft_eager, sampling
 ):
     path = ROOT / "vllm/model_executor/models/mmuse/validation.py"
     tree = ast.parse(path.read_text())
     scope = {}
     exec(compile(tree, str(path), "exec"), scope)
     spec = NS(
-        draft_sample_method="probabilistic",
+        draft_sample_method=sampling,
         enforce_eager=draft_eager,
         enable_adaptive_verification=False,
         num_speculative_tokens=3,
+        uses_dynamic_speculative_decoding=lambda: False,
     )
     config = NS(speculative_config=spec, model_config=NS(enforce_eager=target_eager))
     source = {"sample_from_anchor": True, "block_size": 3}
@@ -160,6 +162,18 @@ def test_probability_contract_allows_target_full_and_keeps_sampling_checks(
     spec.enable_adaptive_verification = False
     source["block_size"] = 4
     with pytest.raises(ValueError, match="block_size"):
+        scope["_validate_qwen3_sampling"](config, source)
+    source["block_size"] = 3
+    source["sample_from_anchor"] = False
+    with pytest.raises(ValueError, match="sample_from_anchor"):
+        scope["_validate_qwen3_sampling"](config, source)
+    source["sample_from_anchor"] = True
+    spec.uses_dynamic_speculative_decoding = lambda: True
+    with pytest.raises(ValueError, match="fixed trained query block"):
+        scope["_validate_qwen3_sampling"](config, source)
+    spec.uses_dynamic_speculative_decoding = lambda: False
+    config.watermark_config = object()
+    with pytest.raises(ValueError, match="watermarking"):
         scope["_validate_qwen3_sampling"](config, source)
 
 

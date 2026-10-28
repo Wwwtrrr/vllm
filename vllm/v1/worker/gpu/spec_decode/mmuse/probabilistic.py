@@ -37,11 +37,11 @@ class MMuseProbabilisticSampling:
         self.seeds.zero_()
 
     def prepare_sampling(self, batch, num_rejected, temperature, seeds, dummy_run):
-        self.idx_mapping.fill_(-1)
-        self.sample_positions.zero_()
         if dummy_run:
             self.reset_sampling()
             return
+        self.idx_mapping.fill_(-1)
+        self.sample_positions.zero_()
         count = batch.num_reqs
         self.idx_mapping[:count].copy_(batch.idx_mapping[:count])
         self.temperature.copy_(temperature)

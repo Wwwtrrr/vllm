@@ -21,7 +21,7 @@ def validate_mmuse_config(config) -> None:
     }
     validator = validators.get(config.model_config.hf_config.model_type)
     if validator is None:
-        raise ValueError("MMuse reference adapter requires a Qwen3 target")
+        raise ValueError("MMuse adapter requires a Qwen3 or DeepSeek V4 target")
     validator(config, source)
 
 
@@ -71,22 +71,15 @@ def _validate_qwen3_execution(config) -> None:
 
 
 def _validate_qwen3_sampling(config, source) -> None:
-    """Check probabilistic sampling and its logits-cache contract."""
+    """Check the fixed query-block contract shared by both sampling modes."""
     spec = config.speculative_config
-    if spec.draft_sample_method == "probabilistic":
-        if getattr(config, "watermark_config", None) is not None:
-            raise ValueError(
-                "MMuse probabilistic drafting does not support watermarking"
-            )
-        if spec.enable_adaptive_verification:
-            raise ValueError(
-                "MMuse probabilistic adaptive verification is not supported"
-            )
-        if not source.get("sample_from_anchor", True):
-            raise ValueError(
-                "MMuse probabilistic drafting requires sample_from_anchor=True"
-            )
-        if spec.num_speculative_tokens != source["block_size"]:
-            raise ValueError(
-                "MMuse num_speculative_tokens must equal trained block_size"
-            )
+    if spec.num_speculative_tokens != source["block_size"]:
+        raise ValueError("MMuse num_speculative_tokens must equal trained block_size")
+    if not source.get("sample_from_anchor", True):
+        raise ValueError("MMuse requires sample_from_anchor=True")
+    if spec.enable_adaptive_verification:
+        raise ValueError("MMuse does not support adaptive verification")
+    if spec.uses_dynamic_speculative_decoding():
+        raise ValueError("MMuse requires a fixed trained query block length")
+    if getattr(config, "watermark_config", None) is not None:
+        raise ValueError("MMuse does not support watermarking")
