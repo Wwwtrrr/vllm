@@ -143,7 +143,8 @@ unallocated page. Allocated page counts come from scheduler CPU metadata.
 
 Supported scope is DeepSeek MMuse's existing replicated BF16 Draft contract,
 greedy/probabilistic sampling, Eager/FULL execution and standard
-`[2, blocks, tokens, heads, dim]` cache layout. KV transfer configurations and
+`[blocks, tokens, heads, dim]` K/V views (the MRV2 tuple representation),
+or their stacked `[2, blocks, tokens, heads, dim]` representation. KV transfer configurations and
 alternative cache layouts are rejected. The existing feature history and
 dense context preparation buffers remain; this backend replaces page allocation
 and cache reads/writes, not feature extraction or Correction. Validate the native
