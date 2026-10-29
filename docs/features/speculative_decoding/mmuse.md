@@ -49,11 +49,98 @@ is a correctness reference, not a throughput optimization. Target backbone
 quantization remains the backend's responsibility. Interface checks do not prove
 that the serving Target weights match the training teacher numerically.
 
-Require BF16 activations, an unquantized draft, eager Target and Draft,
+Require BF16 activations, an unquantized draft,
 `enable_prefix_caching=False`, and PP/DP/context parallel sizes of one. Target TP
 may exceed one; Draft computation is replicated. Adaptive verification,
-watermarking and local argmax reduction are rejected. FULL graphs are not
-implemented for this path.
+watermarking and local argmax reduction are rejected. Eager remains the
+reference path; the optional FULL query path is described below.
+
+### DeepSeek MMuse FULL query graphs
+
+Target retains the existing DeepSeek/Ascend FULL graph path, including W4A8
+quantization and attention/cache handling. With Draft `enforce_eager=True`,
+`MMuseReferenceSpeculator` remains eager and can consume graph-produced Target
+features. With Draft `enforce_eager=False`, Model Runner V2 selects
+`DeepseekMMuseFullSpeculator` / `AscendDeepseekMMuseFullSpeculator`.
+
+The new path reuses the reference model, trained teacher IO and QuaRot binding.
+Declared rotations are still undone in FP32 before feature normalization/fusion.
+The Draft configuration disables Dynamo compilation on a copy and clears the
+Target quantizer. It does not change Target compilation or quantization.
+
+Confirmed history update, feature projection, context normalization and K/V
+projection run outside capture. FULL takes one device-to-host metadata snapshot
+per proposal, retaining request-ID and contiguous-position validation. Confirmed
+feature history updates its reserved storage in place. Context capacities use powers of two from
+128 up to the reserved history capacity, including a final non-power-of-two
+capacity when necessary. Negative context positions identify padding; both full
+and sliding attention mask them. Query anchor conditioning gathers the last
+valid context row instead of the end of the padded buffer.
+
+Each native CUDA/NPU graph captures one K-token query decoder and complete MMuse
+rollout, including native probability sampling and logits writes when selected.
+Requests replay serially through stable input/context buffers; output is copied
+before the next request reuses them. There is no Draft paged attention layer and
+no Draft updatable-attention task: native Torch operators use fixed shapes.
+Target graph updates are unchanged. Native graph ownership participates in the
+runner's memory-profiling cleanup so profiling captures are not retained.
+
+For a K=7 checkpoint, preserve the working W4A8 Target settings and use:
+
+```python
+enforce_eager = False  # Target
+enable_prefix_caching = False
+speculative_config = {
+    "method": "mmuse",
+    "model": "/path/to/deepseek-v4-flash-mmuse",
+    "num_speculative_tokens": 7,
+    "enforce_eager": False,
+    "draft_sample_method": "greedy",  # Or "probabilistic".
+}
+compilation_config = {
+    "cudagraph_mode": "FULL",
+    "cudagraph_capture_sizes": [8],  # Target BS1 verify shape; BS4 also needs 32.
+}
+```
+
+Preserve the baseline Target's compilation mode and other compilation settings;
+the example only shows the FULL mode and verification size. Retain smaller
+Target capture sizes needed by the workload, including prefill.
+Draft capture shapes are context buckets with one complete K-token query, not
+the Target token-size list. Probabilistic mode uses request seeds, temperatures
+and absolute query positions, with pre-temperature logits cached by persistent
+request slot. Capture uses slot -1 and does not write live probability caches.
+NPU FP64 Gumbel is rejected. The older optional `mmuse_draft_kv_reuse` must be
+disabled for this new path; it remains available for eager Draft execution.
+
+Extra buffers per TP rank include approximately
+`(capacity * hidden_size + 2 * layers * capacity * kv_heads * head_dim) * dtype_bytes`,
+in addition to the existing per-request feature history and native graph
+workspaces. The shared buffers cache the last active request's normalized context
+and context K/V: only newly confirmed or overwritten rows are projected, and a
+sliding prefix moves within existing storage. A request/slot change recomputes
+valid context rows. Padding is zeroed without projection. This avoids allocating
+a separate K/V cache for every request, but alternating requests do not benefit
+from incremental reuse. Padding in captured query attention, the remaining
+metadata synchronization and Python request processing may still limit speed.
+Native device validation and throughput measurements remain required.
+
+CPU tests cover padded/unpadded decoder parity, mixed full/sliding layers,
+convolution, context anchor conditioning, overwritten contexts and independent
+request outputs. Optional native tests capture decoder plus real MMuse heads and
+sampling, changing context lengths, seeds and request slots across replays:
+
+```bash
+pytest --noconftest --import-mode=importlib tests/v1/spec_decode/test_mmuse_deepseek_graph.py -q
+```
+
+These synthetic tests do not validate the W4A8 Target or TP serving. On the
+server compare Eager/Eager, Target FULL/Draft Eager, then FULL/FULL using the same
+checkpoint, requests and TP layout. Check mean-HC layer IDs/order, live auxiliary
+features, QuaRot alignment, rejection rollback, EOS and reused request slots.
+Only after correctness checks measure unprofiled steady-state throughput and
+memory. Existing DSpark FULL success is the Target execution baseline, not proof
+of MMuse feature or probability correctness.
 
 ### Optional confirmed-context KV reuse
 
@@ -124,7 +211,8 @@ do not establish end-to-end correctness or speedup.
 - Speculators-format `speculators_model_type="mmuse"` configuration.
 - `sample_from_anchor=True`, full-attention draft layers, enabled Correction.
 - Fixed proposal length equal to the trained block size (typically 7).
-- Greedy or probabilistic draft proposals, eager execution, one device.
+- Greedy proposals with eager or FULL query execution, one device.
+- Probabilistic proposals with eager or FULL query execution, one device.
 - No quantization, watermarking or adaptive verification.
 
 These are implementation limits; commenting out a configuration check does not
@@ -148,10 +236,13 @@ validate this extension.
 
 ## Implementation
 
-`MMuseSpeculator` inherits `DFlashSpeculator`; `AscendMMuseSpeculator` inherits
-`AscendDFlashSpeculator`. Both mix in `MMuseGreedyRolloutMixin`. They retain the
-DFlash context insertion and Attention metadata, while selecting an anchor plus
-`block_size - 1` mask queries. All `block_size` positions predict tokens.
+Greedy Qwen3 uses `MMuseGreedySpeculator`, directly derived from the generic
+`DraftModelSpeculator`. Ascend uses `AscendMMuseGreedySpeculator` and its own
+`MMuseAclGraphManager`. Input preparation, model loading and graph capture do
+not call the DFlash proposer or DFlash graph managers. Probabilistic execution
+selects `MMuseProbabilisticSpeculator` / `AscendMMuseProbabilisticSpeculator`.
+These extend our independent query engine and graph managers with request-scoped
+sampling buffers; they do not inherit the DFlash proposer.
 
 `MMuseQwen3ForCausalLM` uses native vLLM Qwen3/DFlash Attention and projections.
 Its decoder wraps Attention and MLP with the source dynamic convolution, preserving
@@ -172,6 +263,116 @@ Missing trainable parameters fail loading. Full-vocabulary embedding and LM-head
 weights are intentionally taken from the target; this is distinct from missing
 trained draft parameters. Confidence weights are loaded but are not used for
 adaptive proposal length in this first version.
+
+### Qwen3 FULL graph boundary
+
+Target uses the framework's original model graph manager. This adapter does not
+change Target attention, capture sizes, synchronization or graph-update ordering.
+Draft has an independent capture lifecycle:
+
+1. Project the current Target auxiliary features and select the last confirmed
+   context anchor, excluding rejected suffixes.
+2. Prepare K query rows per request, context/cache slots and absolute positions
+   in persistent buffers. Null blocks and rejected/padded rows receive PAD slots.
+3. Project and store confirmed context K/V outside the graph. Long prefill
+   contexts follow the same path as decode context.
+4. Build current-step query attention metadata once.
+5. Replay query decoder, complete Correction/Selector/Markov rollout and
+   output-buffer write together. Shapes absent from the capture set run eagerly.
+
+Thus FULL covers the draft query forward and rollout, not the whole proposal
+pipeline, context projection, Target verification or the scheduling loop.
+The model backbone still uses native Qwen3/DFlash attention and weight packing;
+shared MMuse prediction modules are not duplicated.
+
+The Draft's copied compilation configuration uses `CompilationMode.NONE` to
+avoid compiling the eager MMuse Python rollout through Dynamo. This does not
+disable device graph capture and does not change the Target configuration.
+Ascend uses native `UpdatableGraph` task updates with the already-built current
+metadata. It does not remove required events or promise to fix MEM_WAIT overhead.
+Only the updatable full-attention backend is supported by this independent NPU
+path; unsupported graph backends fail explicitly.
+
+For a checkpoint with K=7 and `max_num_seqs=1`, retain the existing model/dtype/
+tokenizer settings and use:
+
+```python
+enforce_eager = False  # Target
+speculative_config = {
+    "method": "mmuse",
+    "model": "/path/to/qwen3_4b_mmuse",
+    "num_speculative_tokens": 7,
+    "draft_sample_method": "greedy",
+    "enforce_eager": False,
+}
+compilation_config = {
+    "mode": 0,
+    "cudagraph_mode": "FULL",
+    "cudagraph_capture_sizes": [7, 8],
+}
+```
+
+Use Model Runner V2. Sizes count tokens, not requests: Draft needs a complete
+7-row block; Target verification can need 8 rows. For BS4 include 28 and 32,
+and preserve smaller capture sizes to exercise shrinking batches. K must equal
+the checkpoint's trained block size. Keep TP/PP/DP/CP=1. Context anchor storage
+is a nonpersistent model buffer, moved with the model and stable during replay.
+
+Before deployment compare the same requests with NONE, Target FULL + Draft
+eager, and both FULL. Warm up separately, disable profiling for timing, compare
+output tokens/logits, acceptance, EOS and repeated request-slot reuse. Measure
+prefill and decode separately. Graph capture succeeding is not performance or
+correctness acceptance.
+
+`tests/v1/spec_decode/test_mmuse_greedy_graph.py` covers independent query layout,
+rejection, null blocks, shrinking/reordered batches and compilation isolation.
+`test_mmuse_rollout_graph.py` exercises the real prediction runtime with synthetic
+weights, including native CUDA/NPU capture when hardware is available. Ascend's
+`tests/ut/spec_decode/test_mmuse_greedy_graph.py` covers current-step task resolution
+and capture-context restoration. These tests do not validate paged attention or
+trained-checkpoint quality; full-model GPU/NPU acceptance is still required.
+
+### Probabilistic FULL execution
+
+Use the FULL configuration above and explicitly change
+`speculative_config["draft_sample_method"] = "probabilistic"`. Both Target and
+Draft may have `enforce_eager=False`; Target uses its native FULL graph path.
+Begin with request `temperature=0.7`, `top_p=1.0`, `top_k=-1`, repetition penalty
+1 and a fixed request seed. Draft retains temperature-only proposal sampling;
+Target retains its normal processing.
+
+The probability extension captures native Gumbel sampling, final-logit cache
+writes and sampled-token feedback together with the MMuse rollout. Request
+mapping, seeds, temperatures and absolute positions are updated in persistent
+buffers before replay. A query at P predicts token P+1, so its random key uses
+P plus the native draft-stream salt. Random state is not frozen at capture
+time; repeating the same seed and position intentionally reproduces the draw.
+
+Cache storage is `[max_num_seqs, K, vocab_size]`, in the verifier's head dtype.
+Sampling first casts logits to this same precision, then caches them before
+temperature scaling. Only live request slots may be written. Capture, dummy
+execution and padded rows use state index -1, leaving other requests' caches
+unchanged. Zero-temperature requests use argmax within mixed batches.
+NPU rejects FP64 Gumbel explicitly. Adaptive verification, dynamic proposal
+lengths and watermarking remain unsupported.
+
+`test_mmuse_probabilistic_graph.py` covers slot remapping, rejection-adjusted
+positions, cache precision and inactive rows. Optional CUDA/NPU cases capture
+real MMuse heads and the native sampler with synthetic weights, then compare
+replay against eager execution while changing seeds, anchors, features and
+request occupancy. Run from the vLLM repository in the matching backend
+environment:
+
+```bash
+pytest --noconftest --import-mode=importlib tests/v1/spec_decode/test_mmuse_probabilistic_graph.py -q
+```
+
+These checks do not execute full-model paged attention or Target rejection.
+Before claiming correctness or speedup, compare the trained checkpoint with
+NONE, Target FULL + eager Draft, and both FULL. Check multi-round verification,
+first/middle rejection, EOS, reused request slots and output distributions at
+nonzero temperature. GPU and NPU need not produce identical random streams.
+Measure steady-state throughput without profiling after a separate warmup.
 
 ## Environment and launch template
 
@@ -218,13 +419,20 @@ checks. Only then measure acceptance length, latency, memory and throughput.
 ## Adapter code layout
 
 - `models/mmuse/validation.py` dispatches model-specific execution checks;
-  `models/mmuse_runtime.py` keeps the public validation import and Qwen3 rollout
-  helpers.
+  `models/mmuse_runtime.py` keeps runtime construction, the public validation
+  import and legacy rollout helpers used by compatibility/parity checks.
+- `worker/gpu/spec_decode/mmuse/greedy.py` and `probabilistic.py` implement the
+  current Qwen3 worker paths. Ascend uses corresponding subclasses. The older
+  DFlash-based `mmuse/speculator.py` classes are retained import entry points;
+  neither worker factory selects them. They are distinct from the checkpoint
+  architecture string `MMuseSpeculator`, which remains a model-registry alias
+  for `MMuseQwen3ForCausalLM` and must not be removed as an unused worker class.
 - `models/mmuse/deepseek_contract.py` validates the DeepSeek training export.
   `models/mmuse/context.py` owns confirmed feature history and optional context
   K/V reuse; the former module retains compatibility imports for these classes.
 - `models/deepseek_mmuse_reference.py` loads trained tensors and binds teacher
   or deployed Target IO without changing checkpoint parameter names.
 - `worker/gpu/spec_decode/mmuse/reference.py` prepares verified context, query
-  blocks and proposals. The Ascend subclass supplies NPU sampling and QuaRot
-  matrix loading.
+  blocks and proposals for eager DeepSeek drafting. `deepseek_full.py` adds its
+  fixed-context graph path. Both support greedy and probabilistic proposals.
+  The Ascend subclasses supply NPU sampling, graph backend and QuaRot binding.

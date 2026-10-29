@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Eager, single-device Qwen3 MMuse adapter with standalone inference heads."""
+"""Single-device Qwen3 MMuse model for eager and native graph execution."""
 
 import weakref
 from collections.abc import Iterable
@@ -68,30 +68,37 @@ class MMuseQwen3Model(DFlashQwen3Model):
 
     def __init__(self, *, vllm_config, **kwargs):
         super().__init__(vllm_config=vllm_config, **kwargs)
-        self.context_anchor = torch.zeros(
-            vllm_config.scheduler_config.max_num_seqs,
-            self.config.hidden_size,
-            dtype=vllm_config.model_config.dtype,
+        self.register_buffer(
+            "context_anchor",
+            torch.zeros(
+                vllm_config.scheduler_config.max_num_seqs,
+                self.config.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+            ),
+            persistent=False,
         )
 
     def forward(self, input_ids, positions, input_embeds=None):
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
-        block = self.config.block_size
-        if input_embeds.shape[0] % block:
+        block_size = self.config.block_size
+        num_query_rows = input_embeds.shape[0]
+        if num_query_rows % block_size:
             raise ValueError("MMuse query rows must contain complete trained blocks")
-        count = input_embeds.shape[0] // block
+        num_requests = num_query_rows // block_size
         runtime = self._runtime_ref()
-        hidden = input_embeds.reshape(count, block, -1)
-        if runtime.block_position_embedding is not None:
-            slots = torch.arange(block, device=hidden.device)
-            hidden = hidden + runtime.block_position_embedding(slots)[None]
-        if runtime.context_hidden_proj is not None:
-            residual = runtime.context_hidden_proj(self.context_anchor[:count])
-            hidden = hidden + (
+        query_hidden = input_embeds.reshape(num_requests, block_size, -1)
+        position_embedding = runtime.block_position_embedding
+        context_projection = runtime.context_hidden_proj
+        if position_embedding is not None:
+            slots = torch.arange(block_size, device=query_hidden.device)
+            query_hidden = query_hidden + position_embedding(slots)[None]
+        if context_projection is not None:
+            residual = context_projection(self.context_anchor[:num_requests])
+            query_hidden = query_hidden + (
                 torch.tanh(runtime.context_hidden_gate) * residual[:, None]
             )
-        return super().forward(input_ids, positions, hidden.flatten(0, 1))
+        return super().forward(input_ids, positions, query_hidden.flatten(0, 1))
 
 
 class _TargetEmbedding(nn.Module):
@@ -136,8 +143,7 @@ class MMuseQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         self._target_weights_bound = False
 
     def combine_hidden_states(self, hidden_states):
-        projection, _ = self.runtime._prepare_target_hidden(hidden_states)
-        return projection
+        return self.runtime._prepare_target_hidden(hidden_states)[0]
 
     def bind_target_weights(self, target_model):
         target = (
@@ -158,20 +164,25 @@ class MMuseQwen3ForCausalLM(DFlashQwen3ForCausalLM):
             hidden, anchor_ids, temperature=0.0, sample_token=sample_token
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        mapped = []
+    @staticmethod
+    def _map_checkpoint_weights(weights: Iterable[tuple[str, torch.Tensor]]):
+        """Route backbone and inference-head weights to their registered modules."""
         for name, weight in weights:
-            if name in ("t2d", "d2t") or name.startswith("verifier_"):
-                continue
-            if name.startswith(("embed_tokens.", "lm_head.")):
-                # Full-vocabulary MMuse always borrows these from the target.
+            if name in ("t2d", "d2t") or name.startswith(
+                ("verifier_", "embed_tokens.", "lm_head.")
+            ):
+                # Full-vocabulary MMuse borrows teacher IO from the Target.
                 continue
             if name.startswith(("layers.", "fc.", "hidden_norm.", "norm.")):
                 name = "model." + name
             else:
                 name = "runtime." + name
-            mapped.append((name, weight))
-        loaded = AutoWeightsLoader(self).load_weights(mapped)
+            yield name, weight
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        loaded = AutoWeightsLoader(self).load_weights(
+            self._map_checkpoint_weights(weights)
+        )
         borrowed = {"model.embed_tokens.weight", "lm_head.weight"}
         initialized = {"model.mask_embedding"}
         missing = {name for name, _ in self.named_parameters()} - loaded

@@ -17,7 +17,10 @@ def build_mmuse_runtime(source_config: dict, fc: nn.Module) -> nn.Module:
 
 
 class MMuseGreedyRolloutMixin:
-    """Shared GPU/NPU rollout with greedy or framework probabilistic sampling."""
+    """Legacy DFlash-based rollout retained for compatibility and parity checks.
+
+    Current worker factories select the independent Qwen3 proposers instead.
+    """
 
     def _mmuse_gumbel_sample(self, *args, **kwargs):
         from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample

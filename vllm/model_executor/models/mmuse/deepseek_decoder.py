@@ -84,7 +84,7 @@ class BlockAttention(nn.Module):
         groups = self.heads // self.kv_heads
         k = k.transpose(0, 1).repeat_interleave(groups, 0)
         v = v.transpose(0, 1).repeat_interleave(groups, 0)
-        visible = context_positions < positions[0]
+        visible = (context_positions >= 0) & (context_positions < positions[0])
         if self.window is not None:
             visible &= context_positions >= positions[0] - self.window
         block = torch.ones(

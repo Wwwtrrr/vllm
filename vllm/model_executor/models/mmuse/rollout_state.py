@@ -77,26 +77,27 @@ class RolloutFeedbackState:
             assert self.hidden_mask is not None  # noqa: S101
             kwargs["previous_corrected_hidden"] = self.corrected_hidden
             kwargs["previous_corrected_hidden_mask"] = self.hidden_mask
-        if logit_feedback_enabled:
-            if has_conditioning_features:
-                assert conditioning_previous_logits_mask is not None  # noqa: S101
-                kwargs["previous_logits_mask"] = conditioning_previous_logits_mask[
+        if not logit_feedback_enabled:
+            return kwargs
+        if has_conditioning_features:
+            assert conditioning_previous_logits_mask is not None  # noqa: S101
+            kwargs["previous_logits_mask"] = conditioning_previous_logits_mask[
+                :, position : position + 1
+            ]
+            if conditioning_previous_rank_features is not None:
+                kwargs["previous_rank_features"] = conditioning_previous_rank_features[
                     :, position : position + 1
                 ]
-                if conditioning_previous_rank_features is not None:
-                    kwargs["previous_rank_features"] = (
-                        conditioning_previous_rank_features[:, position : position + 1]
-                    )
-            elif online_selector:
-                assert self.online_mask is not None  # noqa: S101
-                kwargs["previous_logits_mask"] = self.online_mask
-                if self.online_rank_features is not None:
-                    kwargs["previous_rank_features"] = self.online_rank_features
-            else:
-                assert self.dense_logits is not None  # noqa: S101
-                assert self.dense_mask is not None  # noqa: S101
-                kwargs["previous_logits"] = self.dense_logits
-                kwargs["previous_logits_mask"] = self.dense_mask
+        elif online_selector:
+            assert self.online_mask is not None  # noqa: S101
+            kwargs["previous_logits_mask"] = self.online_mask
+            if self.online_rank_features is not None:
+                kwargs["previous_rank_features"] = self.online_rank_features
+        else:
+            assert self.dense_logits is not None  # noqa: S101
+            assert self.dense_mask is not None  # noqa: S101
+            kwargs["previous_logits"] = self.dense_logits
+            kwargs["previous_logits_mask"] = self.dense_mask
         return kwargs
 
     def advance(
@@ -118,24 +119,28 @@ class RolloutFeedbackState:
         compact features take precedence at the next step. Do not skip that call
         or move it across sampling, hidden feedback or next-token mapping.
         """
-        if (
-            logit_feedback_enabled
-            and not has_conditioning_features
-            and not online_selector
-            and position >= start_position
-        ):
-            self.dense_logits = final_logits.detach().unsqueeze(1)
-            self.dense_mask = torch.ones(
-                final_logits.shape[0], 1, dtype=torch.bool, device=final_logits.device
-            )
-        if online_selector and logit_feedback_enabled and position >= start_position:
-            self.online_mask = torch.ones(
-                final_logits.shape[0], 1, dtype=torch.bool, device=final_logits.device
-            )
-            self.online_rank_features = correction_head.encode_previous_distribution(
-                self.online_mask,
-                previous_logits=final_logits.detach().unsqueeze(1),
-            )
+        if logit_feedback_enabled and position >= start_position:
+            if online_selector:
+                self.online_mask = torch.ones(
+                    final_logits.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=final_logits.device,
+                )
+                self.online_rank_features = (
+                    correction_head.encode_previous_distribution(
+                        self.online_mask,
+                        previous_logits=final_logits.detach().unsqueeze(1),
+                    )
+                )
+            elif not has_conditioning_features:
+                self.dense_logits = final_logits.detach().unsqueeze(1)
+                self.dense_mask = torch.ones(
+                    final_logits.shape[0],
+                    1,
+                    dtype=torch.bool,
+                    device=final_logits.device,
+                )
         if hidden_feedback_enabled:
             self.corrected_hidden = corrected_current_hidden.unsqueeze(1)
             self.hidden_mask = torch.ones(
