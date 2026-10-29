@@ -533,6 +533,19 @@ def test_proposer_preserves_anchor_alignment_after_rejection_and_reordering(
     torch.testing.assert_close(proposer.model.feature_storage, saved)
 
 
+@pytest.mark.parametrize("backend", ["reference", "ascend_fia", "unknown"])
+def test_reference_platform_rejects_unavailable_attention_backends(backend):
+    proposer = reference_proposer()
+    proposer.vllm_config = SimpleNamespace(
+        additional_config={"mmuse_attention_backend": backend}
+    )
+    if backend == "reference":
+        proposer.configure_attention(object())
+    else:
+        with pytest.raises(ValueError, match="only reference"):
+            proposer.configure_attention(object())
+
+
 def test_draft_loader_isolates_target_quantizer_without_rebuilding_target_config(
     monkeypatch,
 ):

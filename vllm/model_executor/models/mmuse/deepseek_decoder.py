@@ -46,6 +46,9 @@ class BlockAttention(nn.Module):
         self.dim = config.head_dim or config.hidden_size // self.heads
         self.window = window
         self.causal = window is not None and not noncausal
+        # A platform may bind an inference kernel before warmup/capture.
+        # None keeps the numerical reference, including its explicit GQA expansion.
+        self.attention_impl = None
         rope = getattr(config, "rope_parameters", None) or {}
         self.theta = rope.get("rope_theta", getattr(config, "rope_theta", 1000000.0))
         for name, width in (
@@ -81,9 +84,6 @@ class BlockAttention(nn.Module):
             query_k, query_v = self.project_kv(query, positions)
             k = torch.cat((context_kv[0], query_k))
             v = torch.cat((context_kv[1], query_v))
-        groups = self.heads // self.kv_heads
-        k = k.transpose(0, 1).repeat_interleave(groups, 0)
-        v = v.transpose(0, 1).repeat_interleave(groups, 0)
         visible = (context_positions >= 0) & (context_positions < positions[0])
         if self.window is not None:
             visible &= context_positions >= positions[0] - self.window
@@ -93,6 +93,12 @@ class BlockAttention(nn.Module):
         if self.causal:
             block = block.tril()
         mask = torch.cat((visible[None].expand(query.shape[0], -1), block), -1)
+        if self.attention_impl is not None:
+            out = self.attention_impl(q, k, v, mask)
+            return self.o_proj(out.reshape(query.shape[0], -1))
+        groups = self.heads // self.kv_heads
+        k = k.transpose(0, 1).repeat_interleave(groups, 0)
+        v = v.transpose(0, 1).repeat_interleave(groups, 0)
         out = F.scaled_dot_product_attention(
             q.transpose(0, 1)[None], k[None], v[None], attn_mask=mask[None, None]
         )[0]

@@ -172,6 +172,68 @@ def test_incremental_context_projects_only_changed_rows(dtype, monkeypatch):
         hook.remove()
 
 
+@torch.inference_mode()
+def test_platform_attention_matches_decoder_logits_after_history_changes(monkeypatch):
+    torch.manual_seed(23)
+    owner = model("cpu", torch.bfloat16, (4, None), monkeypatch)
+    graph = pure_module("deepseek_graph").DeepseekMMuseGraphs
+    driver = graph(
+        owner,
+        3,
+        None,
+        None,
+        torch.zeros(2),
+        torch.zeros(2, dtype=torch.long),
+        False,
+        None,
+    )
+    observed = []
+
+    def platform_attention(q, k, v, visible):
+        # Boundary oracle: the platform receives unexpanded KV heads and the
+        # exact mask used by the reference, including per-layer window rules.
+        assert k.shape[1] == v.shape[1] == 2
+        observed.append(visible.clone())
+        groups = q.shape[1] // k.shape[1]
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(0, 1)[None],
+            k.transpose(0, 1).repeat_interleave(groups, 0)[None],
+            v.transpose(0, 1).repeat_interleave(groups, 0)[None],
+            attn_mask=visible[None, None],
+        )[0].transpose(0, 1)
+
+    features = torch.randn(16, 16, dtype=torch.bfloat16)
+    for start, end in [(0, 3), (0, 12), (2, 9), (0, 2)]:
+        features[start:end] += 0.1
+        size = driver.prepare(
+            torch.arange(start, end), features[start:end], torch.tensor([7]), 0
+        )
+        args = (
+            driver.input_ids,
+            driver.positions,
+            driver.context_positions[:size],
+            driver.context[:size],
+            tuple(kv[:, :size] for kv in driver.context_kv),
+            driver.anchor_index,
+        )
+        for layer in owner.layers:
+            layer.self_attn.attention_impl = None
+        expected = owner.forward_fixed_context(*args)
+        expected_tokens, expected_logits = owner.runtime.rollout_correction(
+            expected[None], driver.input_ids[:1]
+        )
+        for layer in owner.layers:
+            layer.self_attn.attention_impl = platform_attention
+        actual = owner.forward_fixed_context(*args)
+        actual_tokens, actual_logits = owner.runtime.rollout_correction(
+            actual[None], driver.input_ids[:1]
+        )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_logits, expected_logits)
+        torch.testing.assert_close(actual_tokens, expected_tokens)
+    assert len(observed) == 8
+
+
 @pytest.mark.parametrize("windows", [(None, None), (4, 4), (4, None)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()

@@ -55,6 +55,36 @@ may exceed one; Draft computation is replicated. Adaptive verification,
 watermarking and local argmax reduction are rejected. Eager remains the
 reference path; the optional FULL query path is described below.
 
+### DeepSeek MMuse platform attention bridge
+
+DeepSeek Draft attention defaults to the independent SDPA reference. Ascend
+provides an explicit dense FIA bridge using TorchNPU's
+`npu_fused_infer_attention_score`, the inference operator family used by its
+native attention backend. Select it when constructing a new engine:
+
+```python
+additional_config = {"mmuse_attention_backend": "ascend_fia"}
+```
+
+Use `"reference"` (or omit the key) for the reference path. Other platforms reject
+`ascend_fia`; this selector applies to DeepSeek MMuse, not Qwen3 or Target
+attention. Recreate the engine/graphs when changing backends.
+
+The bridge preserves the explicit per-layer mask: fixed-anchor context window,
+optional causal query block, and padded context exclusion. It converts SDPA's
+allowed boolean mask to FIA's excluded boolean mask and passes compact GQA KV
+heads directly. BF16/FP16 tensors use dense BNSD layout. Eager and FULL Draft
+paths bind the same callable before warmup/capture; runtime errors are not
+silently redirected to SDPA.
+
+This is the first kernel-integration stage, not a paged-cache conversion. Existing
+verified-feature history, context KV storage, query KV concatenation and graph
+ownership remain unchanged. It does not register Draft `AttentionLayerBase` or
+updatable attention tasks. Synthetic tests cover hidden/logits/token parity at
+the platform boundary; optional NPU tests exercise real FIA and changing inputs
+and masks across native graph replay. Trained-model acceptance and TPOT must be
+compared on the deployment hardware before selecting this backend for service.
+
 ### DeepSeek MMuse FULL query graphs
 
 Target retains the existing DeepSeek/Ascend FULL graph path, including W4A8

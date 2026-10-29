@@ -28,7 +28,15 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
             vllm_config=draft_context, model_config=self.draft_model_config
         )
         model.bind_target(target_model, rotation=self.get_target_rotation())
+        self.configure_attention(model)
         return model
+
+    def configure_attention(self, model):
+        backend = (getattr(self.vllm_config, "additional_config", None) or {}).get(
+            "mmuse_attention_backend", "reference"
+        )
+        if backend != "reference":
+            raise ValueError("This MMuse platform supports only reference attention")
 
     def get_target_rotation(self):
         return None
