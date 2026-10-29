@@ -117,6 +117,14 @@ For scheduler-owned Draft pages, select the framework allocation backend:
 additional_config = {"mmuse_attention_backend": "ascend_framework_fia"}
 ```
 
+This backend also binds the loaded replicated Decoder to framework `RMSNorm`,
+`ReplicatedLinear` (`disable_tp=True`, no Target quantizer), `SiluAndMul` and
+`ApplyRotaryEmb`. Parameter names and loaded weights are preserved, including
+the shared Runtime `fc`. Rotary coefficients are precomputed with the original
+theta and half-pairing, including the `-1` padding position. Reference and dense
+FIA paths retain their original primitives for numerical comparisons. Fused
+primitive rounding may differ; compare outputs and acceptance on the device.
+
 It registers one ordinary unquantized `Attention` cache owner per Draft layer.
 The worker collects their full-attention KV specs, allocates their pages, and
 reclaims/reuses them through the normal request lifecycle. The proposer maps
@@ -532,3 +540,21 @@ checks. Only then measure acceptance length, latency, memory and throughput.
   blocks and proposals for eager DeepSeek drafting. `deepseek_full.py` adds its
   fixed-context graph path. Both support greedy and probabilistic proposals.
   The Ascend subclasses supply NPU sampling, graph backend and QuaRot binding.
+
+
+### Framework reuse boundaries
+
+The stock Ascend causal `Attention.forward` metadata does not express MMuse's
+fixed-anchor context window plus per-layer causal/noncausal query-block mask.
+The FIA bridge therefore remains model-specific; it must not be replaced with
+ordinary decode metadata just to reuse that entry point. Cache allocation and
+writes already use the framework, while the explicit mask remains authoritative.
+
+The public `ACLGraphWrapper` also assumes forward-context batch descriptors and
+updatable attention metadata and can add a synchronization before FULL replay.
+MMuse has an independent context-bucket key, fixed tensor-bound arguments and
+no registered attention update tasks. Its native capture/replay coordinator is
+retained under the existing `CudaGraphManager` lifecycle rather than silently
+switching to that wrapper. Buffer preparation is required even with a public
+wrapper, which does not own model input buffers. A broader replacement requires
+a dedicated metadata/dispatch contract and NPU replay profiling.

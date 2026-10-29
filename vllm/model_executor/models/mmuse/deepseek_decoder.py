@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Replicated block decoder matching MMuse's offline evaluator.
 
-No AttentionLayerBase modules or paged draft KV are registered. Target TP is
-independent: every rank executes the complete dense drafter and its heads.
+Platform bindings may replace primitives and register paged Draft caches.
+Target TP is independent: every rank executes the complete dense drafter and its heads.
 Confirmed-context KV may be supplied separately; query KV remains ephemeral.
 """
 
@@ -48,6 +48,7 @@ class BlockAttention(nn.Module):
         self.causal = window is not None and not noncausal
         # A platform may bind an inference kernel before warmup/capture.
         # None keeps the numerical reference, including its explicit GQA expansion.
+        self.rotary_impl = None
         self.attention_impl = None
         self.paged_attention_impl = None
         rope = getattr(config, "rope_parameters", None) or {}
@@ -71,7 +72,12 @@ class BlockAttention(nn.Module):
     def project_kv(self, hidden, positions):
         k = self.k_norm(self.k_proj(hidden).reshape(-1, self.kv_heads, self.dim))
         v = self.v_proj(hidden).reshape(-1, self.kv_heads, self.dim)
-        return rotate(k, positions, self.theta), v
+        return self.apply_rotary(k, positions), v
+
+    def apply_rotary(self, value, positions):
+        if self.rotary_impl is not None:
+            return self.rotary_impl(value, positions)
+        return rotate(value, positions, self.theta)
 
     def forward(
         self,
@@ -83,7 +89,7 @@ class BlockAttention(nn.Module):
         context_kv_prepared=False,
     ):
         q = self.q_norm(self.q_proj(query).reshape(-1, self.heads, self.dim))
-        q = rotate(q, positions, self.theta)
+        q = self.apply_rotary(q, positions)
         paged = self.paged_attention_impl
         if paged is not None:
             query_k, query_v = self.project_kv(query, positions)
@@ -130,6 +136,7 @@ class BlockAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.activation_impl = None
         self.gate_proj = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=False
         )
@@ -141,7 +148,12 @@ class MLP(nn.Module):
         )
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        if self.activation_impl is not None:
+            hidden = self.activation_impl(torch.cat((gate, up), -1))
+        else:
+            hidden = F.silu(gate) * up
+        return self.down_proj(hidden)
 
 
 class BlockLayer(nn.Module):

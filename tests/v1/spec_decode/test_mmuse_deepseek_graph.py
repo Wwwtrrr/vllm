@@ -518,3 +518,110 @@ def test_proposal_replays_each_request_and_owns_outputs_before_next_replay(monke
     snapshot = result.clone()
     driver.output.fill_(31)
     torch.testing.assert_close(result, snapshot)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_framework_decoder_preserves_loaded_weights_padding_and_block_outputs(
+    dtype, monkeypatch
+):
+    from contextlib import contextmanager
+
+    torch.manual_seed(71)
+    owner = model("cpu", dtype, (4, None), monkeypatch)
+    owner.fc = owner.runtime.fc
+    baseline = copy.deepcopy(owner)
+    original = {name: value.clone() for name, value in owner.state_dict().items()}
+    reference = pure_module("deepseek_decoder")
+    calls = []
+    config_module = ModuleType("vllm.config")
+
+    @contextmanager
+    def context(config):
+        assert config.quant_config is None
+        yield
+
+    config_module.set_current_vllm_config = context
+    norms = ModuleType("vllm.model_executor.layers.layernorm")
+
+    class Norm(reference.RMS):
+        def __init__(self, width, eps, dtype):
+            super().__init__(width, eps)
+            self.to(dtype=dtype)
+
+    norms.RMSNorm = Norm
+    linears = ModuleType("vllm.model_executor.layers.linear")
+
+    class Linear(torch.nn.Linear):
+        def __init__(
+            self,
+            inputs,
+            outputs,
+            bias,
+            params_dtype,
+            quant_config,
+            prefix,
+            return_bias,
+            disable_tp,
+        ):
+            assert quant_config is None and disable_tp and not return_bias
+            super().__init__(inputs, outputs, bias=bias, dtype=params_dtype)
+            calls.append(prefix)
+            self.quant_method = NS(process_weights_after_loading=lambda layer: None)
+
+    linears.ReplicatedLinear = Linear
+    acts = ModuleType("vllm.model_executor.layers.activation")
+
+    class Activation(torch.nn.Module):
+        def forward(self, x):
+            gate, up = x.chunk(2, -1)
+            return torch.nn.functional.silu(gate) * up
+
+    acts.SiluAndMul = Activation
+    rotary = ModuleType("vllm.model_executor.layers.rotary_embedding.common")
+
+    class Apply(torch.nn.Module):
+        def __init__(self, is_neox_style):
+            super().__init__()
+            assert is_neox_style
+
+        def forward(self, x, cos, sin):
+            left, right = x.chunk(2, -1)
+            return (
+                x * torch.cat((cos, cos), -1)[:, None]
+                + torch.cat((-right, left), -1) * torch.cat((sin, sin), -1)[:, None]
+            )
+
+    rotary.ApplyRotaryEmb = Apply
+    for module in (config_module, norms, linears, acts, rotary):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    framework = pure_module("framework_decoder")
+    config = NS(
+        quant_config=object(),
+        model_config=NS(max_model_len=64),
+        speculative_config=NS(num_speculative_tokens=3),
+    )
+    framework.bind_framework_decoder(owner, config)
+    framework.bind_framework_decoder(owner, config)  # No duplicate conversion.
+    assert len(calls) == 1 + 7 * len(owner.layers)
+    assert config.quant_config is not None
+    assert owner.fc is owner.runtime.fc
+    assert owner.state_dict().keys() == original.keys()
+    for name, value in owner.state_dict().items():
+        torch.testing.assert_close(value, original[name], atol=0, rtol=0)
+    positions = torch.tensor([-1, 0, 7, 66])
+    k = torch.randn(4, 2, 4, dtype=dtype)
+    actual = owner.layers[0].self_attn.apply_rotary(k, positions)
+    expected = reference.rotate(k, positions, 10000.0)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    context = torch.randn(9, 16, dtype=dtype)
+    context_positions = torch.arange(9)
+    context_positions[-2:] = -1
+    query_positions = torch.arange(7, 10)
+    query = torch.randn(3, 16, dtype=dtype)
+    for ref_layer, layer in zip(baseline.layers, owner.layers):
+        expected = ref_layer(query, context, query_positions, context_positions)
+        actual = layer(query, context, query_positions, context_positions)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # CPU dependency oracles check binding and tensor contracts. Native fused
+    # kernel numerical behavior still requires the device tests/server run.
