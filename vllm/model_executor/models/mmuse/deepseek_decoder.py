@@ -49,6 +49,7 @@ class BlockAttention(nn.Module):
         # A platform may bind an inference kernel before warmup/capture.
         # None keeps the numerical reference, including its explicit GQA expansion.
         self.attention_impl = None
+        self.paged_attention_impl = None
         rope = getattr(config, "rope_parameters", None) or {}
         self.theta = rope.get("rope_theta", getattr(config, "rope_theta", 1000000.0))
         for name, width in (
@@ -72,10 +73,28 @@ class BlockAttention(nn.Module):
         v = self.v_proj(hidden).reshape(-1, self.kv_heads, self.dim)
         return rotate(k, positions, self.theta), v
 
-    def forward(self, query, context, positions, context_positions, context_kv=None):
+    def forward(
+        self,
+        query,
+        context,
+        positions,
+        context_positions,
+        context_kv=None,
+        context_kv_prepared=False,
+    ):
         q = self.q_norm(self.q_proj(query).reshape(-1, self.heads, self.dim))
         q = rotate(q, positions, self.theta)
-        if context_kv is None:
+        paged = self.paged_attention_impl
+        if paged is not None:
+            query_k, query_v = self.project_kv(query, positions)
+            if not context_kv_prepared:
+                context_k, context_v = (
+                    self.project_kv(context, context_positions)
+                    if context_kv is None
+                    else context_kv
+                )
+                paged.prepare_context(context_k, context_v)
+        elif context_kv is None:
             k, v = self.project_kv(
                 torch.cat((context, query)),
                 torch.cat((context_positions, positions)),
@@ -93,6 +112,9 @@ class BlockAttention(nn.Module):
         if self.causal:
             block = block.tril()
         mask = torch.cat((visible[None].expand(query.shape[0], -1), block), -1)
+        if paged is not None:
+            out = paged(q, query_k, query_v, mask)
+            return self.o_proj(out.reshape(query.shape[0], -1))
         if self.attention_impl is not None:
             out = self.attention_impl(q, k, v, mask)
             return self.o_proj(out.reshape(query.shape[0], -1))
@@ -142,14 +164,27 @@ class BlockLayer(nn.Module):
                 )
             setattr(self, name, conv)
 
-    def forward(self, hidden, context, positions, context_positions, context_kv=None):
+    def forward(
+        self,
+        hidden,
+        context,
+        positions,
+        context_positions,
+        context_kv=None,
+        context_kv_prepared=False,
+    ):
         residual = hidden
         value = self.input_layernorm(hidden)
         coefficients = None
         if self.attention_conv is not None:
             value, coefficients = self.attention_conv.prepare(value)
         value = self.self_attn(
-            value, context, positions, context_positions, context_kv=context_kv
+            value,
+            context,
+            positions,
+            context_positions,
+            context_kv=context_kv,
+            context_kv_prepared=context_kv_prepared,
         )
         if self.attention_conv is not None:
             value = self.attention_conv.finish(value, coefficients)

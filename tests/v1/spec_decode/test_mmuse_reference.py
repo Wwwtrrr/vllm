@@ -581,6 +581,40 @@ def test_draft_loader_isolates_target_quantizer_without_rebuilding_target_config
     assert proposer.vllm_config.load_config == "target"
 
 
+def test_framework_cache_hook_uses_scheduler_batch_rows_and_actual_kernel_pages():
+    proposer = reference_proposer()
+    calls = []
+    paged = SimpleNamespace(
+        requires_eager=False,
+        cache_owner=SimpleNamespace(layer_name="draft_model.layers.0.self_attn.attn"),
+        set_page_size=lambda size: calls.append(("page", size)),
+        begin_request=lambda table, start, end: calls.append(
+            ("request", table.clone(), start, end)
+        ),
+        reset_request=lambda: calls.append(("reset",)),
+    )
+    proposer.model = SimpleNamespace(
+        layers=[SimpleNamespace(self_attn=SimpleNamespace(paged_attention_impl=paged))]
+    )
+    table = torch.tensor([[4, 8], [3, 6]], dtype=torch.int32)
+    blocks = SimpleNamespace(
+        kernel_block_sizes=[64],
+        input_block_tables=[table],
+        num_blocks=SimpleNamespace(np=torch.tensor([[2, 1]])),
+        blocks_per_kv_block=[1],
+    )
+    cache = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=[paged.cache_owner.layer_name])]
+    )
+    proposer.set_attn(None, cache, blocks, None, [])
+    proposer.prepare_request_attention(1, 65, 99, request_slot=1)
+    proposer.prepare_request_attention(None)
+    assert calls[0] == ("page", 64)
+    torch.testing.assert_close(calls[1][1], table[1, :1])
+    assert calls[1][2:] == (65, 99)
+    assert calls[2] == ("reset",)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.int8, torch.float8_e4m3fn])
 def test_borrowed_io_gathers_float_shards_and_matches_draft_dtype(dtype):
     path = DIRECTORY.parent / "deepseek_mmuse_reference.py"

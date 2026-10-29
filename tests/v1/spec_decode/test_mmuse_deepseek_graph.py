@@ -379,6 +379,9 @@ def test_full_draft_config_is_isolated_and_legacy_kv_reuse_is_rejected():
         def __init__(self, config, device):
             self.vllm_config = config
 
+        def propose(self, *args):
+            return "eager-profile"
+
     scope = {
         "MMuseReferenceSpeculator": Base,
         "copy": copy,
@@ -390,6 +393,18 @@ def test_full_draft_config_is_isolated_and_legacy_kv_reuse_is_rejected():
     obj = scope[cls.name](config, "cpu")
     assert obj.vllm_config.compilation_config.mode == 0
     assert config.compilation_config.mode == 3
+    for full, dummy, profile in [
+        (False, False, False),
+        (True, True, False),
+        (True, False, True),
+    ]:
+        obj.full_enabled = full
+        obj.fixed_graphs = NS(context_entry=(0, "a", 0, 16))
+        assert (
+            obj.propose(*([None] * 11), dummy_run=dummy, is_profile=profile)
+            == "eager-profile"
+        )
+        assert obj.fixed_graphs.context_entry is None
     config.additional_config["mmuse_draft_kv_reuse"] = True
     with pytest.raises(ValueError, match="disable mmuse_draft_kv_reuse"):
         scope[cls.name](config, "cpu")
@@ -468,6 +483,7 @@ def test_proposal_replays_each_request_and_owns_outputs_before_next_replay(monke
         seeds=driver.seeds,
         draft_tokens=torch.empty(2, 3, dtype=torch.int64),
         _project_target_features=lambda batch, aux, dummy: aux[0],
+        prepare_request_attention=lambda *args: None,
     )
     batch = NS(
         num_reqs=2,

@@ -111,7 +111,7 @@ class BorrowedIO(nn.Module):
 
 
 class DeepseekMMuseReference(nn.Module):
-    """Replicate the draft on each target TP rank; no draft paged-KV allocation."""
+    """Replicate the draft; platforms may attach cache owners after weight loading."""
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
@@ -278,7 +278,8 @@ class DeepseekMMuseReference(nn.Module):
     ):
         """Query-only forward over padded, immutable-shape context buffers.
 
-        The caller normalizes/projects confirmed context outside capture.
+        The caller normalizes/projects confirmed context outside capture and
+        prepares platform paged context when that backend is selected.
         Padding positions are -1 and are masked by BlockAttention.
         """
         hidden = F.embedding(input_ids, self.embedding_weight)
@@ -298,6 +299,7 @@ class DeepseekMMuseReference(nn.Module):
                 positions,
                 context_positions,
                 context_kv=kv,
+                context_kv_prepared=True,
             )
         return self.norm(hidden)
 

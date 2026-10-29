@@ -113,6 +113,10 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
         is_profile=False,
     ):
         if not self.full_enabled or dummy_run or is_profile:
+            # Eager/profile calls may overwrite a shared paged arena. The next
+            # FULL prepare must rebuild it rather than reuse stale span metadata.
+            if self.fixed_graphs is not None:
+                self.fixed_graphs.context_entry = None
             return super().propose(
                 input_batch,
                 attn_metadata,
@@ -178,6 +182,7 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
             request, context_start, context_end, update_start = (
                 self.model.history.spans[slot]
             )
+            self.prepare_request_attention(row, context_start, context_end, slot)
             size = self.fixed_graphs.prepare(
                 positions,
                 features,
@@ -188,7 +193,14 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
                 end=context_end,
                 update_start=max(context_start, update_start),
             )
-            self.query_cudagraph_manager.replay(size)
+            if getattr(self, "native_attention_requires_eager", False):
+                # Near the scheduler length limit, a complete trained query may
+                # not fit its lookahead pages. Compute it densely, without any
+                # write to null/unallocated pages, and invalidate page reuse.
+                self.fixed_graphs.forward(size)
+                self.fixed_graphs.context_entry = None
+            else:
+                self.query_cudagraph_manager.replay(size)
             # Copy before the next request overwrites shared graph buffers.
             self.draft_tokens[row].copy_(self.fixed_graphs.output)
         return self.draft_tokens[:count]

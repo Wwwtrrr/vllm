@@ -49,9 +49,39 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
         target_input_buffers,
         target_attn_groups,
     ):
-        # No draft AttentionLayerBase objects are registered: target caches and
-        # their Ascend allocator are unchanged by the replicated reference draft.
+        # Reference/private arenas need no KV group. A platform may register
+        # cache-owning layers and consume the corresponding scheduler tables.
         self.target_input_buffers = target_input_buffers
+        self.block_tables = block_tables
+        self.framework_attention_groups = []
+        name_to_group = {
+            name: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            for name in group.layer_names
+        }
+        for layer in getattr(self.model, "layers", ()):
+            paged = layer.self_attn.paged_attention_impl
+            owner = getattr(paged, "cache_owner", None)
+            if owner is not None:
+                group_id = name_to_group[owner.layer_name]
+                paged.set_page_size(block_tables.kernel_block_sizes[group_id])
+                self.framework_attention_groups.append((paged, group_id))
+
+    def prepare_request_attention(self, row, start=None, end=None, request_slot=None):
+        self.native_attention_requires_eager = False
+        for paged, group_id in getattr(self, "framework_attention_groups", ()):
+            if row is None:
+                paged.reset_request()
+            else:
+                table = self.block_tables.input_block_tables[group_id][row]
+                if request_slot is not None:
+                    allocated = int(
+                        self.block_tables.num_blocks.np[group_id, request_slot]
+                    )
+                    allocated *= self.block_tables.blocks_per_kv_block[group_id]
+                    table = table[:allocated]
+                paged.begin_request(table, start, end)
+                self.native_attention_requires_eager |= paged.requires_eager
 
     def init_cudagraph_manager(self, cudagraph_mode):
         pass
@@ -137,6 +167,7 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
         for batch_row in range(count):
             request_slot = int(input_batch.idx_mapping_np[batch_row])
             if dummy_run:
+                self.prepare_request_attention(None)
                 length = model.feature_storage.shape[1]
                 context_positions = torch.arange(length, device=self.device)
                 features = torch.zeros_like(model.feature_storage[request_slot])
@@ -150,6 +181,10 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
                     input_batch.req_ids[batch_row],
                     input_batch.positions[start:end],
                     projected[start:end],
+                )
+                _, context_start, context_end, _ = model.history.spans[request_slot]
+                self.prepare_request_attention(
+                    batch_row, context_start, context_end, request_slot
                 )
                 anchor = (
                     last_sampled[request_slot]

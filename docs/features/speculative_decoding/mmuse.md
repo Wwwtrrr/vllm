@@ -85,6 +85,71 @@ the platform boundary; optional NPU tests exercise real FIA and changing inputs
 and masks across native graph replay. Trained-model acceptance and TPOT must be
 compared on the deployment hardware before selecting this backend for service.
 
+The next opt-in stage uses native Ascend cache writes and paged FIA reads:
+
+```python
+additional_config = {"mmuse_attention_backend": "ascend_paged_fia"}
+```
+
+Each Draft layer reserves a private 128-token-page arena before memory profiling.
+It uses `DeviceOperator.reshape_and_cache` to write K/V and FIA's `block_table`
+and actual sequence length to read them. This is not the scheduler's dynamic
+block allocator and does not borrow Target pages. The existing dense context
+buffers remain as the reference/incremental preparation source, so this stage
+adds a second, page-rounded K/V copy plus up to K query slots per layer.
+
+FULL preparation writes new/corrected context and zeroed padding outside capture;
+a sliding-window shift rewrites the relocated prefix. Query K/V writes and PA
+reads occur inside the query graph, without context/query K/V concatenation.
+Eager execution prepares context before each attention call. A request change,
+slot reuse or eager/profile fallback invalidates reuse as appropriate. Actual
+length and the original explicit mask prevent stale tails from becoming visible.
+
+This private arena follows the existing serial replay ownership model: it does
+not retain separate page histories for interleaved requests. The validated dense
+`ascend_fia` path remains available for comparison. Recreate the engine and all
+graphs when switching backends. Native PA accuracy and graph replay tests require
+NPU hardware; CPU page-table oracles do not validate kernel support or speed.
+
+For scheduler-owned Draft pages, select the framework allocation backend:
+
+```python
+additional_config = {"mmuse_attention_backend": "ascend_framework_fia"}
+```
+
+It registers one ordinary unquantized `Attention` cache owner per Draft layer.
+The worker collects their full-attention KV specs, allocates their pages, and
+reclaims/reuses them through the normal request lifecycle. The proposer maps
+each cache owner to its KV group and selects the scheduler's current batch row;
+it does not allocate a separate private K/V arena. Full specs intentionally
+retain pages needed by the trained fixed-anchor mask instead of using a
+per-query sliding-window eviction policy.
+
+Context projection still reuses the incremental dense K/V cache. Valid context
+rows are rewritten to the current scheduler pages before replay, because a
+retained projection does not guarantee that physical pages survived preemption.
+Context and query writes use absolute token positions. FULL captures read stable
+page-table, bounds and query-slot buffers that are updated before replay. A
+virtual padded page table maps unused columns to reserved block zero, and a
+remapped explicit mask excludes leading offsets, padding and stale tails. Valid
+query positions map back to their scheduler slots, not the end of a padded
+context bucket. Leading/tail fragments of allocated Draft pages are cleared so
+uninitialized masked values cannot introduce NaNs. Capture uses null-page reads
+and inert writes; profiling before cache allocation uses dense FIA without
+retaining profile context tensors. If the scheduler has not allocated enough
+lookahead pages for a complete Draft block (for example near the model length
+limit), that request uses dense FIA outside replay rather than accessing an
+unallocated page. Allocated page counts come from scheduler CPU metadata.
+
+Supported scope is DeepSeek MMuse's existing replicated BF16 Draft contract,
+greedy/probabilistic sampling, Eager/FULL execution and standard
+`[2, blocks, tokens, heads, dim]` cache layout. KV transfer configurations and
+alternative cache layouts are rejected. The existing feature history and
+dense context preparation buffers remain; this backend replaces page allocation
+and cache reads/writes, not feature extraction or Correction. Validate the native
+cache binding, multi-round outputs and performance on the target NPU software
+stack before production use.
+
 ### DeepSeek MMuse FULL query graphs
 
 Target retains the existing DeepSeek/Ascend FULL graph path, including W4A8

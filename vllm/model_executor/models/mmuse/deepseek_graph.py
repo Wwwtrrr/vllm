@@ -94,6 +94,12 @@ class DeepseekMMuseGraphs:
         )
         self.output.copy_(tokens[0])
 
+    def prepare_platform_context(self, size, start=0):
+        for layer, storage in zip(self.model.layers, self.context_kv):
+            paged = layer.self_attn.paged_attention_impl
+            if paged is not None:
+                paged.prepare_context(storage[0, :size], storage[1, :size], start=start)
+
     @torch.inference_mode()
     def prepare(
         self,
@@ -152,6 +158,7 @@ class DeepseekMMuseGraphs:
                 storage[0, reused:length].copy_(key)
                 storage[1, reused:length].copy_(value)
             storage[:, length:size].zero_()
+        self.prepare_platform_context(size, start=0 if shift else reused)
         if known_span:
             self.context_entry = (slot, request_id, start, end)
         return size
@@ -162,6 +169,12 @@ class DeepseekMMuseGraphs:
             raise RuntimeError("DeepSeek MMuse graphs were already captured")
         self.pool = self.backend.graph_pool_handle()
         self.context_entry = None
+        for layer in self.model.layers:
+            prepare = getattr(
+                layer.self_attn.paged_attention_impl, "prepare_for_capture", None
+            )
+            if prepare is not None:
+                prepare()
         self.request_slot.fill_(-1)
         self.context.zero_()
         self.context_positions.fill_(-1)
@@ -176,6 +189,7 @@ class DeepseekMMuseGraphs:
         stream.wait_stream(self.backend.current_stream())
         with self.backend.stream(stream):
             for size in reversed(self.sizes):
+                self.prepare_platform_context(size)
                 # Warm kernels before entering native capture.
                 for _ in range(3):
                     self.forward(size)
