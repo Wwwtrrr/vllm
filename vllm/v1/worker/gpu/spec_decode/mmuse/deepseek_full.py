@@ -8,6 +8,9 @@ import torch
 from vllm.config import CompilationMode
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.model_executor.models.mmuse.deepseek_context_graph import (
+    DeepseekMMuseContextGraphs,
+)
 from vllm.model_executor.models.mmuse.deepseek_features import (
     DeepseekMMuseFeatureGraphs,
 )
@@ -27,6 +30,8 @@ class DeepseekMMuseGraphManager(CudaGraphManager):
         self.context_graphs = {}
         self.feature_graphs = {}
         self.feature_pool = None
+        self.context_prepare_graphs = {}
+        self.context_prepare_pool = None
 
     def capture(self):
         features = getattr(self.inputs, "feature_inputs", None)
@@ -35,6 +40,12 @@ class DeepseekMMuseGraphManager(CudaGraphManager):
             self.feature_graphs = features.graphs
             features.graphs = {}
             self.feature_pool = features.pool
+        context = getattr(self.inputs, "context_inputs", None)
+        if context is not None:
+            context.capture()
+            self.context_prepare_graphs = context.graphs
+            context.graphs = {}
+            self.context_prepare_pool = context.pool
         self.inputs.capture()
         # The runner drops CudaGraphManager instances after memory profiling.
         # Keep graph references here, not in the persistent input buffers.
@@ -44,6 +55,11 @@ class DeepseekMMuseGraphManager(CudaGraphManager):
 
     def project_features(self, states):
         return self.inputs.feature_inputs.project(states, self.feature_graphs)
+
+    def prepare_context(self, features, positions):
+        return self.inputs.context_inputs.project(
+            features, positions, self.context_prepare_graphs
+        )
 
     def replay(self, size):
         self.context_graphs[size].replay()
@@ -100,6 +116,9 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
             capacity,
             self.graph_backend(),
         )
+        self.fixed_graphs.context_inputs = DeepseekMMuseContextGraphs(
+            model, min(capacity, model.feature_storage.shape[1]), self.graph_backend()
+        )
         return model
 
     def _project_captured_features(self, aux_hidden_states):
@@ -120,11 +139,13 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
         )
         logger.info(
             "DeepSeek MMuse draft: FULL=%s, sampling=%s, context buckets=%s; "
-            "history/context KV outside graph; feature projection graph buckets=%s",
+            "history/KV commits outside graph; feature buckets=%s, "
+            "context update buckets=%s",
             self.full_enabled,
             self.speculative_config.draft_sample_method,
             self.fixed_graphs.sizes,
             self.fixed_graphs.feature_inputs.sizes,
+            self.fixed_graphs.context_inputs.sizes,
         )
 
     def capture(self):
@@ -236,6 +257,7 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
                 start=context_start,
                 end=context_end,
                 update_start=max(context_start, update_start),
+                context_projector=self.query_cudagraph_manager.prepare_context,
             )
             if getattr(self, "native_attention_requires_eager", False):
                 # Near the scheduler length limit, a complete trained query may

@@ -585,3 +585,33 @@ outside this graph. A feature graph reduces submission overhead for projection;
 it does not capture the entire decode step or remove all synchronization.
 Native CUDA/NPU tests compare eager projection and replay across changing row
 counts; hardware is required to validate native accuracy, memory and TPOT.
+
+
+### DeepSeek FULL incremental context preparation graphs
+
+The FULL Draft also captures a separate row-local context preparation graph:
+`hidden_norm -> per-layer K/V projections -> K normalization -> RoPE`. Its
+inputs are the changed suffix and its absolute positions, not the whole history.
+It shares the native row-bucket capture machinery used by feature projection.
+The preparation capacity is bounded by the smaller of the feature-row capacity
+and context-history capacity. Larger updates (including long initial prefill or
+cache rebuilds) retain the original eager projection; no rows are dropped.
+
+Each graph writes normalized features and per-layer K/V to fixed staging
+buffers. Only valid rows are copied into the existing context buffers at their
+actual update offset. Bucket padding is never committed. Historical prefix
+reuse, rejection overwrite, window movement, request changes and page mapping
+remain governed by the existing CPU logic. Sliding-window copies, valid-row
+commits, tail clearing and platform cache writes stay outside this graph.
+The graph does not make scheduler page writes incremental or remove metadata
+D2H synchronization.
+
+This is automatic for DeepSeek MMuse Draft FULL on CUDA/Ascend, without a new
+configuration option. Buffers are allocated before memory profiling, and graph
+handles/pools belong to the same runner-owned manager as the feature/query
+graphs. Profile/dummy and uncaptured execution retain eager behavior. Regression
+tests compare staged K/V and final candidates across append, rejection,
+rollback, eviction and request reuse, with optional native replay tests.
+Validate native numerical accuracy, acceptance and steady-state ITL/TPOT on the
+server: padding, input copies, extra graph memory and commits can offset launch
+savings, so capture success alone is not a performance result.

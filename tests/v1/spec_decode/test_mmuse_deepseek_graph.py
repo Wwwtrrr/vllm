@@ -111,8 +111,11 @@ def model(device, dtype, windows, monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("captured_prepare", [False, True])
 @torch.inference_mode()
-def test_incremental_context_projects_only_changed_rows(dtype, monkeypatch):
+def test_incremental_context_projects_only_changed_rows(
+    dtype, captured_prepare, monkeypatch
+):
     torch.manual_seed(17)
     owner = model("cpu", dtype, (4, None), monkeypatch)
     graph = pure_module("deepseek_graph").DeepseekMMuseGraphs
@@ -127,6 +130,18 @@ def test_incremental_context_projects_only_changed_rows(dtype, monkeypatch):
         None,
     )
     incremental, reference = graph(*args), graph(*args)
+    projector = None
+    if captured_prepare:
+        preparation = pure_module("deepseek_context_graph").DeepseekMMuseContextGraphs(
+            owner, 8, None
+        )
+        handles = {
+            size: NS(replay=lambda size=size: preparation.forward(size))
+            for size in preparation.sizes
+        }
+        projector = lambda values, positions: preparation.project(
+            values, positions, handles
+        )
     features = torch.randn(30, 16, dtype=dtype)
     rows = []
     hook = owner.layers[0].self_attn.k_proj.register_forward_pre_hook(
@@ -157,8 +172,14 @@ def test_incremental_context_projects_only_changed_rows(dtype, monkeypatch):
                 start=start,
                 end=end,
                 update_start=update,
+                context_projector=projector,
             )
-            assert rows == ([expected_rows] if expected_rows else [])
+            projected_rows = expected_rows
+            if captured_prepare and 0 < expected_rows <= 8:
+                projected_rows = next(
+                    size for size in preparation.sizes if size >= expected_rows
+                )
+            assert rows == ([projected_rows] if projected_rows else [])
             reference.prepare(positions, values, torch.tensor([7]), slot)
             tolerance = 0.03 if dtype == torch.bfloat16 else 2e-6
             for actual, expected in zip(incremental.context_kv, reference.context_kv):
@@ -446,10 +467,27 @@ def test_graph_ownership_is_detached_from_persistent_inputs_after_capture():
         feature_calls.append((states, graphs)) or "projected"
     )
     inputs.feature_inputs = features
+    context = NS(graphs={}, pool="context-prepare-pool")
+
+    def capture_context():
+        assert not context.graphs
+        context.graphs = {4: graph}
+
+    context.capture = capture_context
+    context.project = lambda values, positions, graphs: (values, positions, graphs)
+    inputs.context_inputs = context
     manager = scope[cls.name](None, "cpu", inputs)
     manager.capture()
     assert inputs.graphs == {} and features.graphs == {}
     assert manager.feature_pool == "feature-pool"
+    assert (
+        context.graphs == {} and manager.context_prepare_pool == "context-prepare-pool"
+    )
+    assert manager.prepare_context("values", "positions") == (
+        "values",
+        "positions",
+        {4: graph},
+    )
     assert manager.project_features("aux") == "projected"
     assert feature_calls == [("aux", {8: graph})]
     manager.replay(16)
@@ -459,6 +497,7 @@ def test_graph_ownership_is_detached_from_persistent_inputs_after_capture():
     replacement = scope[cls.name](None, "cpu", inputs)
     replacement.capture()
     assert features.graphs == {} and replacement.feature_graphs == {8: graph}
+    assert context.graphs == {} and replacement.context_prepare_graphs == {4: graph}
     replacement.replay(16)
     assert calls == ["replay", "replay"]
 
@@ -494,7 +533,9 @@ def test_proposal_replays_each_request_and_owns_outputs_before_next_replay(monke
         full_enabled=True,
         model=owner,
         fixed_graphs=driver,
-        query_cudagraph_manager=NS(replay=driver.forward),
+        query_cudagraph_manager=NS(
+            replay=driver.forward, prepare_context=lambda *args: None
+        ),
         temperature=driver.temperature,
         seeds=driver.seeds,
         draft_tokens=torch.empty(2, 3, dtype=torch.int64),
@@ -819,3 +860,91 @@ def test_feature_projection_dispatch_uses_eager_when_uncaptured():
     assert owner._project_captured_features([]) == "graph"
     owner.full_enabled = False
     assert owner._project_captured_features([]) == "eager"
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_context_preparation_graph_preserves_absolute_positions_and_valid_rows(
+    device, dtype, monkeypatch
+):
+    from contextlib import nullcontext
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if device == "npu":
+        pytest.importorskip("torch_npu")
+        if not torch.npu.is_available():
+            pytest.skip("NPU required")
+    torch.manual_seed(377)
+    owner = model(device, dtype, (4, None), monkeypatch)
+
+    class Stream:
+        def wait_stream(self, other):
+            pass
+
+    backend = NS(
+        Stream=Stream,
+        current_stream=Stream,
+        stream=lambda stream: nullcontext(),
+        synchronize=lambda: None,
+        graph_pool_handle=lambda: object(),
+        CUDAGraph=lambda: NS(),
+        graph=lambda *args, **kwargs: nullcontext(),
+    )
+    if device != "cpu":
+        backend = getattr(torch, device)
+    preparation = pure_module("deepseek_context_graph").DeepseekMMuseContextGraphs(
+        owner, 8, backend
+    )
+    preparation.capture()
+    handles, preparation.graphs = preparation.graphs, {}
+    if device == "cpu":
+        handles = {
+            size: NS(replay=lambda size=size: preparation.forward(size))
+            for size in handles
+        }
+    addresses = (
+        preparation.inputs.data_ptr(),
+        preparation.positions.data_ptr(),
+        preparation.output.data_ptr(),
+        *(storage.data_ptr() for storage in preparation.kv),
+    )
+    for rows, start in [(7, 0), (1, 17), (8, 3), (3, 21), (4, 0)]:
+        values = torch.randn(rows * 2, 16, dtype=dtype, device=device)[::2]
+        positions = torch.arange(start, start + rows, device=device)
+        expected_context = owner.hidden_norm(values)
+        expected_kv = [
+            layer.self_attn.project_kv(expected_context, positions)
+            for layer in owner.layers
+        ]
+        preparation.inputs.fill_(float("nan"))
+        context, kv = preparation.project(values, positions, handles)
+        if device != "cpu":
+            backend.synchronize()
+        tolerance = 0.03 if dtype == torch.bfloat16 else 2e-6
+        assert context.shape[0] == rows
+        torch.testing.assert_close(
+            context, expected_context, atol=tolerance, rtol=tolerance
+        )
+        for actual, (key, value) in zip(kv, expected_kv):
+            assert actual.shape[1] == rows
+            torch.testing.assert_close(actual[0], key, atol=tolerance, rtol=tolerance)
+            torch.testing.assert_close(actual[1], value, atol=tolerance, rtol=tolerance)
+        assert addresses == (
+            preparation.inputs.data_ptr(),
+            preparation.positions.data_ptr(),
+            preparation.output.data_ptr(),
+            *(storage.data_ptr() for storage in preparation.kv),
+        )
+    assert preparation.project(values, positions, {}) is None
+    assert (
+        preparation.project(
+            torch.zeros(9, 16, dtype=dtype, device=device),
+            torch.arange(9, device=device),
+            handles,
+        )
+        is None
+    )
+    assert preparation.project(values, positions.to(torch.int32), handles) is None
+    assert preparation.graphs == {}

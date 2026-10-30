@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fixed-context native graphs for the replicated DeepSeek MMuse decoder.
 
-History ownership and context K/V projection stay outside capture. Each graph
-contains one complete query block and rollout; requests replay serially.
+History ownership stays outside capture. Optional preparation graphs project
+changed context rows; query graphs contain one block and rollout, replayed serially.
 """
 
 import torch
@@ -112,6 +112,7 @@ class DeepseekMMuseGraphs:
         start=None,
         end=None,
         update_start=None,
+        context_projector=None,
     ):
         length = features.shape[0]
         size = self.bucket(length)
@@ -140,8 +141,18 @@ class DeepseekMMuseGraphs:
             self.context[:reused].copy_(self.context[shift : shift + reused].clone())
             for storage in self.context_kv:
                 storage[:, :reused].copy_(storage[:, shift : shift + reused].clone())
+        prepared = None
         if reused < length:
-            self.context[reused:length].copy_(self.model.hidden_norm(features[reused:]))
+            if context_projector is not None:
+                prepared = context_projector(
+                    features[reused:], context_positions[reused:]
+                )
+            normalized = (
+                self.model.hidden_norm(features[reused:])
+                if prepared is None
+                else prepared[0]
+            )
+            self.context[reused:length].copy_(normalized)
         self.context[length:size].zero_()
         self.context_positions[:size].fill_(-1)
         self.context_positions[:length].copy_(context_positions)
@@ -150,11 +161,17 @@ class DeepseekMMuseGraphs:
         self.input_ids[:1].copy_(anchor.reshape(1))
         self.positions.copy_(context_positions[-1] + 1 + self.query_offsets)
         self.request_slot.fill_(slot)
-        for layer, storage in zip(self.model.layers, self.context_kv):
+        for index, (layer, storage) in enumerate(
+            zip(self.model.layers, self.context_kv)
+        ):
             if reused < length:
-                key, value = layer.self_attn.project_kv(
-                    self.context[reused:length], self.context_positions[reused:length]
-                )
+                if prepared is None:
+                    key, value = layer.self_attn.project_kv(
+                        self.context[reused:length],
+                        self.context_positions[reused:length],
+                    )
+                else:
+                    key, value = prepared[1][index].unbind(0)
                 storage[0, reused:length].copy_(key)
                 storage[1, reused:length].copy_(value)
             storage[:, length:size].zero_()
