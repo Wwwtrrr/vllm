@@ -538,15 +538,24 @@ def test_proposal_replays_each_request_and_owns_outputs_before_next_replay(monke
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("bias", [False, True])
 @torch.inference_mode()
 def test_framework_decoder_preserves_loaded_weights_padding_and_block_outputs(
-    dtype, monkeypatch
+    dtype, bias, monkeypatch
 ):
     from contextlib import contextmanager
 
     torch.manual_seed(71)
     owner = model("cpu", dtype, (4, None), monkeypatch)
     owner.fc = owner.runtime.fc
+    assert torch.is_inference(owner.fc.weight)
+    if bias:
+        for layer in owner.layers:
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                linear = getattr(layer.self_attn, name)
+                linear.bias = torch.nn.Parameter(
+                    torch.randn(linear.out_features, dtype=dtype)
+                )
     baseline = copy.deepcopy(owner)
     original = {name: value.clone() for name, value in owner.state_dict().items()}
     reference = pure_module("deepseek_decoder")
@@ -584,7 +593,15 @@ def test_framework_decoder_preserves_loaded_weights_padding_and_block_outputs(
             assert quant_config is None and disable_tp and not return_bias
             super().__init__(inputs, outputs, bias=bias, dtype=params_dtype)
             calls.append(prefix)
-            self.quant_method = NS(process_weights_after_loading=lambda layer: None)
+
+            def process(layer):
+                assert not torch.is_inference_mode_enabled()
+                assert not torch.is_inference(layer.weight)
+                assert layer.weight._version >= 0
+                # Simulate a platform layout conversion during postprocessing.
+                layer.weight.data = layer.weight.detach().clone()
+
+            self.quant_method = NS(process_weights_after_loading=process)
 
     linears.ReplicatedLinear = Linear
     acts = ModuleType("vllm.model_executor.layers.activation")
@@ -619,10 +636,38 @@ def test_framework_decoder_preserves_loaded_weights_padding_and_block_outputs(
         speculative_config=NS(num_speculative_tokens=3),
     )
     framework.bind_framework_decoder(owner, config)
+    assert torch.is_inference_mode_enabled()
     framework.bind_framework_decoder(owner, config)  # No duplicate conversion.
     assert len(calls) == 1 + 7 * len(owner.layers)
     assert config.quant_config is not None
     assert owner.fc is owner.runtime.fc
+    for layer in (
+        owner.fc,
+        owner.hidden_norm,
+        owner.norm,
+        *(
+            item
+            for block in owner.layers
+            for item in (
+                block.input_layernorm,
+                block.post_attention_layernorm,
+                block.self_attn.q_norm,
+                block.self_attn.k_norm,
+                block.self_attn.q_proj,
+                block.self_attn.k_proj,
+                block.self_attn.v_proj,
+                block.self_attn.o_proj,
+                block.mlp.gate_proj,
+                block.mlp.up_proj,
+                block.mlp.down_proj,
+            )
+        ),
+    ):
+        assert not torch.is_inference(layer.weight)
+        assert layer.weight._version >= 0
+        if getattr(layer, "bias", None) is not None:
+            assert not torch.is_inference(layer.bias)
+            assert layer.bias._version >= 0
     assert owner.state_dict().keys() == original.keys()
     for name, value in owner.state_dict().items():
         torch.testing.assert_close(value, original[name], atol=0, rtol=0)

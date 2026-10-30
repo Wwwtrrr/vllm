@@ -30,7 +30,8 @@ class CachedRotary(nn.Module):
         return self.apply_rotary(value, self.cos[indexes], self.sin[indexes])
 
 
-@torch.inference_mode()
+@torch.inference_mode(False)
+@torch.no_grad()
 def bind_framework_decoder(model, config):
     if getattr(model, "framework_primitives_bound", False):
         return
@@ -45,24 +46,28 @@ def bind_framework_decoder(model, config):
     draft_config.quant_config = None
 
     def norm(old):
-        result = RMSNorm(old.weight.numel(), eps=old.eps, dtype=old.weight.dtype)
-        result.weight = old.weight
+        with torch.device(old.weight.device):
+            result = RMSNorm(old.weight.numel(), eps=old.eps, dtype=old.weight.dtype)
+        result.weight.copy_(old.weight)
         return result
 
     def linear(old, prefix):
-        result = ReplicatedLinear(
-            old.in_features,
-            old.out_features,
-            bias=old.bias is not None,
-            params_dtype=old.weight.dtype,
-            quant_config=None,
-            prefix=prefix,
-            return_bias=False,
-            disable_tp=True,
-        )
-        result.weight.data = old.weight.data
+        with torch.device(old.weight.device):
+            result = ReplicatedLinear(
+                old.in_features,
+                old.out_features,
+                bias=old.bias is not None,
+                params_dtype=old.weight.dtype,
+                quant_config=None,
+                prefix=prefix,
+                return_bias=False,
+                disable_tp=True,
+            )
+        # Do not alias inference-mode .data into framework Parameters. The
+        # custom GEMM path may inspect their version counters, even for inference.
+        result.weight.copy_(old.weight)
         if old.bias is not None:
-            result.bias.data = old.bias.data
+            result.bias.copy_(old.bias)
         result.quant_method.process_weights_after_loading(result)
         return result
 
