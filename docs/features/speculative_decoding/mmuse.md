@@ -558,3 +558,30 @@ retained under the existing `CudaGraphManager` lifecycle rather than silently
 switching to that wrapper. Buffer preparation is required even with a public
 wrapper, which does not own model input buffers. A broader replacement requires
 a dedicated metadata/dispatch contract and NPU replay profiling.
+
+
+### DeepSeek FULL teacher feature projection graphs
+
+DeepSeek MMuse FULL now captures a separate row-bucketed feature graph before
+capturing the query/rollout graphs. It includes auxiliary-layer concatenation,
+optional FP32 inverse QuaRot, baseline `fc`, and trained gated layer fusion.
+Only valid output rows enter the confirmed history; padding is initialized to
+zero and never committed. The graph does not change trained auxiliary-layer
+IDs or projection weights.
+
+This is automatic for a FULL-enabled Draft, including the Ascend subclass,
+and requires no additional option. Stable input/output buffers are allocated
+before worker memory profiling. Capacity covers the bounded decode workload
+and configured Target capture sizes, capped by `max_num_batched_tokens`;
+power-of-two row buckets plus the final capacity are captured. Larger prefill
+batches, unsupported input dtype/device, uncaptured execution, dummy runs and
+memory-profile forwards keep the original eager projection. The runner-owned
+graph manager retains both feature and query graph handles, allowing its normal
+profiling cleanup to release and recapture them.
+
+Copying current auxiliary rows into graph inputs, CPU metadata extraction,
+verified history management, context K/V preparation and page writes remain
+outside this graph. A feature graph reduces submission overhead for projection;
+it does not capture the entire decode step or remove all synchronization.
+Native CUDA/NPU tests compare eager projection and replay across changing row
+counts; hardware is required to validate native accuracy, memory and TPOT.

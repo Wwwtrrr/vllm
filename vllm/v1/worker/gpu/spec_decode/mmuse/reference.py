@@ -94,7 +94,9 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
 
         return gumbel_sample(*args, **kwargs)
 
-    def _project_target_features(self, input_batch, aux_hidden_states, dummy_run):
+    def _project_target_features(
+        self, input_batch, aux_hidden_states, dummy_run, *, projector=None
+    ):
         model = self.model
         if not dummy_run and not aux_hidden_states:
             raise ValueError(
@@ -112,11 +114,12 @@ class MMuseReferenceSpeculator(DraftModelSpeculator):
                     "MMuse auxiliary tensors do not match "
                     "trained layers and target rows"
                 )
-        return (
-            model.project_features(torch.cat(aux_hidden_states, -1))
-            if aux_hidden_states
-            else None
-        )
+        if not aux_hidden_states:
+            return None
+        return (projector or self._project_feature_tensors)(aux_hidden_states)
+
+    def _project_feature_tensors(self, aux_hidden_states):
+        return self.model.project_features(torch.cat(aux_hidden_states, -1))
 
     def _build_query(self, context_positions, anchor):
         model, block = self.model, self.num_query_per_req

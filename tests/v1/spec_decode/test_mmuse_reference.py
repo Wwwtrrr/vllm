@@ -827,3 +827,25 @@ def test_checkpoint_scalar_gate_layout_preserves_value(
         namespace["load_weights"](other, [("norm.weight", value)])
     with pytest.raises(ValueError, match="Missing trained"):
         namespace["load_weights"](owner, [])
+
+
+def test_feature_projection_hook_preserves_validation_and_eager_default():
+    proposer = reference_proposer()
+    batch = SimpleNamespace(positions=torch.arange(2))
+    states = [torch.randn(2, 3)]
+    calls = []
+    hook = lambda tensors: calls.append(tensors) or "graph"
+    assert (
+        proposer._project_target_features(batch, states, False, projector=hook)
+        == "graph"
+    )
+    assert calls == [states]
+    torch.testing.assert_close(
+        proposer._project_target_features(batch, states, False), states[0]
+    )
+    with pytest.raises(ValueError, match="auxiliary tensors"):
+        proposer._project_target_features(
+            batch, [torch.zeros(2, 12)], False, projector=hook
+        )
+    assert len(calls) == 1
+    assert proposer._project_target_features(batch, None, True, projector=hook) is None

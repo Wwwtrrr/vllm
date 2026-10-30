@@ -8,6 +8,9 @@ import torch
 from vllm.config import CompilationMode
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.model_executor.models.mmuse.deepseek_features import (
+    DeepseekMMuseFeatureGraphs,
+)
 from vllm.model_executor.models.mmuse.deepseek_graph import DeepseekMMuseGraphs
 from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.mmuse.reference import MMuseReferenceSpeculator
@@ -22,14 +25,25 @@ class DeepseekMMuseGraphManager(CudaGraphManager):
         super().__init__(config, device, CUDAGraphMode.NONE, inputs.block_size)
         self.inputs = inputs
         self.context_graphs = {}
+        self.feature_graphs = {}
+        self.feature_pool = None
 
     def capture(self):
+        features = getattr(self.inputs, "feature_inputs", None)
+        if features is not None:
+            features.capture()
+            self.feature_graphs = features.graphs
+            features.graphs = {}
+            self.feature_pool = features.pool
         self.inputs.capture()
         # The runner drops CudaGraphManager instances after memory profiling.
         # Keep graph references here, not in the persistent input buffers.
         self.context_graphs = self.inputs.graphs
         self.inputs.graphs = {}
         self.pool = self.inputs.pool
+
+    def project_features(self, states):
+        return self.inputs.feature_inputs.project(states, self.feature_graphs)
 
     def replay(self, size):
         self.context_graphs[size].replay()
@@ -70,7 +84,31 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
             self.use_fp64_gumbel,
             self.graph_backend(),
         )
+        # Decode-sized row buckets cover the normal verifier batches without
+        # reserving another max-prefill-size auxiliary-feature arena.
+        capacity = min(
+            self.max_num_tokens,
+            max(
+                self.max_num_reqs * (self.num_query_per_req + 1),
+                max(self.vllm_config.compilation_config.cudagraph_capture_sizes or [1]),
+            ),
+        )
+        self.fixed_graphs.feature_inputs = DeepseekMMuseFeatureGraphs(
+            model,
+            len(model.config.mmuse_source_config["aux_hidden_state_layer_ids"]),
+            self.hidden_size,
+            capacity,
+            self.graph_backend(),
+        )
         return model
+
+    def _project_captured_features(self, aux_hidden_states):
+        manager = self.query_cudagraph_manager
+        if self.full_enabled and manager is not None:
+            projected = manager.project_features(aux_hidden_states)
+            if projected is not None:
+                return projected
+        return super()._project_feature_tensors(aux_hidden_states)
 
     def init_cudagraph_manager(self, cudagraph_mode):
         self.query_cudagraph_manager = DeepseekMMuseGraphManager(
@@ -82,10 +120,11 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
         )
         logger.info(
             "DeepSeek MMuse draft: FULL=%s, sampling=%s, context buckets=%s; "
-            "history and context projection outside graph",
+            "history/context KV outside graph; feature projection graph buckets=%s",
             self.full_enabled,
             self.speculative_config.draft_sample_method,
             self.fixed_graphs.sizes,
+            self.fixed_graphs.feature_inputs.sizes,
         )
 
     def capture(self):
@@ -138,7 +177,12 @@ class DeepseekMMuseFullSpeculator(MMuseReferenceSpeculator):
         count = input_batch.num_reqs
         if not count:
             return self.draft_tokens[:0]
-        projected = self._project_target_features(input_batch, aux_hidden_states, False)
+        projected = self._project_target_features(
+            input_batch,
+            aux_hidden_states,
+            False,
+            projector=self._project_captured_features,
+        )
         # One device-to-host snapshot instead of per-field/per-request reads.
         token_count = (
             int(input_batch.query_start_loc_np[count])

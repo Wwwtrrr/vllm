@@ -434,15 +434,31 @@ def test_graph_ownership_is_detached_from_persistent_inputs_after_capture():
         inputs.graphs = {16: graph}
 
     inputs.capture = capture
+    feature_calls = []
+    features = NS(graphs={}, pool="feature-pool")
+
+    def capture_features():
+        assert not features.graphs
+        features.graphs = {8: graph}
+
+    features.capture = capture_features
+    features.project = lambda states, graphs: (
+        feature_calls.append((states, graphs)) or "projected"
+    )
+    inputs.feature_inputs = features
     manager = scope[cls.name](None, "cpu", inputs)
     manager.capture()
-    assert inputs.graphs == {}
+    assert inputs.graphs == {} and features.graphs == {}
+    assert manager.feature_pool == "feature-pool"
+    assert manager.project_features("aux") == "projected"
+    assert feature_calls == [("aux", {8: graph})]
     manager.replay(16)
     assert calls == ["replay"]
     # Profiling cleanup can drop manager without input buffers retaining graphs.
     del manager
     replacement = scope[cls.name](None, "cpu", inputs)
     replacement.capture()
+    assert features.graphs == {} and replacement.feature_graphs == {8: graph}
     replacement.replay(16)
     assert calls == ["replay", "replay"]
 
@@ -482,7 +498,8 @@ def test_proposal_replays_each_request_and_owns_outputs_before_next_replay(monke
         temperature=driver.temperature,
         seeds=driver.seeds,
         draft_tokens=torch.empty(2, 3, dtype=torch.int64),
-        _project_target_features=lambda batch, aux, dummy: aux[0],
+        _project_target_features=lambda batch, aux, dummy, **kwargs: aux[0],
+        _project_captured_features=None,
         prepare_request_attention=lambda *args: None,
     )
     batch = NS(
@@ -625,3 +642,135 @@ def test_framework_decoder_preserves_loaded_weights_padding_and_block_outputs(
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     # CPU dependency oracles check binding and tensor contracts. Native fused
     # kernel numerical behavior still requires the device tests/server run.
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rotation,fusion", [(False, False), (True, True)])
+@torch.inference_mode()
+def test_feature_graph_projection_matches_eager_across_row_buckets(
+    device, dtype, rotation, fusion, monkeypatch
+):
+    from contextlib import nullcontext
+    from types import MethodType
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if device == "npu":
+        pytest.importorskip("torch_npu")
+        if not torch.npu.is_available():
+            pytest.skip("NPU required")
+    torch.manual_seed(931)
+    runtime = helper("test_mmuse_rollout_graph").runtime(device, False, monkeypatch)
+    if fusion:
+        runtime.config.dflash_gated_layer_fusion = True
+        runtime._init_layer_fusion(runtime.config, 16, 2)
+        runtime.layer_fusion_gate.data.fill_(0.7)
+    runtime.to(device=device, dtype=dtype)
+    owner = torch.nn.Module()
+    owner.config = NS(hidden_size=16)
+    owner.runtime = runtime
+    owner.register_buffer(
+        "feature_storage", torch.zeros(2, 16, 16, dtype=dtype, device=device)
+    )
+    matrix = torch.linalg.qr(torch.randn(16, 16))[0].to(device) if rotation else None
+    owner.register_buffer("target_rotation", matrix)
+    tree = ast.parse((MODELS / "deepseek_mmuse_reference.py").read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "DeepseekMMuseReference"
+    )
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == "project_features"
+    )
+    scope = {"torch": torch}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), "features", "exec"), scope)
+    owner.project_features = MethodType(scope["project_features"], owner)
+
+    class Stream:
+        def wait_stream(self, other):
+            pass
+
+    class Backend:
+        current_stream = staticmethod(Stream)
+        stream = staticmethod(lambda stream: nullcontext())
+        synchronize = staticmethod(lambda: None)
+        graph_pool_handle = staticmethod(lambda: object())
+        CUDAGraph = staticmethod(lambda: NS())
+        graph = staticmethod(lambda *args, **kwargs: nullcontext())
+
+    Backend.Stream = Stream
+    backend = Backend if device == "cpu" else getattr(torch, device)
+    driver = pure_module("deepseek_features").DeepseekMMuseFeatureGraphs(
+        owner, 2, 16, 8, backend
+    )
+    driver.capture()
+    graphs, driver.graphs = driver.graphs, {}
+    if device == "cpu":
+        graphs = {
+            size: NS(replay=lambda size=size: driver.forward(size)) for size in graphs
+        }
+    input_address, output_address = driver.inputs.data_ptr(), driver.output.data_ptr()
+    for rows in (7, 1, 8, 3, 6):
+        states = [
+            torch.randn(rows * 2, 16, dtype=dtype, device=device)[::2] for _ in range(2)
+        ]
+        expected = owner.project_features(torch.cat(states, -1))
+        driver.inputs.fill_(float("nan"))
+        actual = driver.project(states, graphs)
+        if device != "cpu":
+            backend.synchronize()
+        assert actual.shape == (rows, 16)
+        torch.testing.assert_close(
+            actual,
+            expected,
+            atol=0.02 if dtype == torch.bfloat16 else 1e-5,
+            rtol=0.02 if dtype == torch.bfloat16 else 1e-5,
+        )
+        assert driver.inputs.data_ptr() == input_address
+        assert driver.output.data_ptr() == output_address
+    # Prefill/unsupported input shapes and absent captures retain eager dispatch.
+    assert (
+        driver.project([torch.empty(9, 16, dtype=dtype, device=device)] * 2, graphs)
+        is None
+    )
+    assert driver.project(states, {}) is None
+    assert driver.project(states[:1], graphs) is None
+    assert (
+        driver.project(
+            [torch.zeros(1, 16, dtype=torch.int32, device=device)] * 2, graphs
+        )
+        is None
+    )
+    assert driver.graphs == {}  # Persistent buffers do not retain graph handles.
+
+
+@torch.inference_mode()
+def test_feature_projection_dispatch_uses_eager_when_uncaptured():
+    path = MODELS.parents[1] / "v1/worker/gpu/spec_decode/mmuse/deepseek_full.py"
+    tree = ast.parse(path.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "DeepseekMMuseFullSpeculator"
+    )
+
+    class Base:
+        def _project_feature_tensors(self, states):
+            return "eager"
+
+    scope = dict(MMuseReferenceSpeculator=Base, copy=copy, torch=torch)
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), scope)
+    owner = scope[cls.name].__new__(scope[cls.name])
+    owner.full_enabled = True
+    owner.query_cudagraph_manager = None
+    assert owner._project_captured_features([]) == "eager"
+    owner.query_cudagraph_manager = NS(project_features=lambda states: None)
+    assert owner._project_captured_features([]) == "eager"
+    owner.query_cudagraph_manager = NS(project_features=lambda states: "graph")
+    assert owner._project_captured_features([]) == "graph"
+    owner.full_enabled = False
+    assert owner._project_captured_features([]) == "eager"
