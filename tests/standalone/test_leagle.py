@@ -5,8 +5,10 @@
 Set LEAGLE_TRAINING_ROOT to the looped_eagle checkout for real training parity.
 """
 
+import ast
 import copy
 import importlib.util
+import inspect
 import os
 import sys
 from contextlib import nullcontext
@@ -183,6 +185,25 @@ def runtime(monkeypatch):
     return load_file(
         "leagle_runtime", "vllm/v1/worker/gpu/spec_decode/leagle/speculator.py"
     )
+
+
+def test_proposer_accepts_actual_runner_profile_and_decode_calls(runtime):
+    source = ROOT / "vllm/v1/worker/gpu/model_runner.py"
+    calls = []
+    for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+        if (
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "self.speculator.propose"
+        ):
+            calls.append(node)
+    assert len(calls) >= 2  # Profiling and real decoding must both bind.
+    signature = inspect.signature(runtime.LEagleSpeculator.propose)
+    for call in calls:
+        signature.bind(
+            object(),
+            *[object() for _ in call.args],
+            **{kw.arg: object() for kw in call.keywords},
+        )
 
 
 def test_proposer_uses_verified_prefix_and_bonus_anchor(runtime):

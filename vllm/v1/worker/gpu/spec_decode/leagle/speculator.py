@@ -125,7 +125,7 @@ class LEagleSpeculator(DraftModelSpeculator):
         next_prefill_tokens,
         temperature,
         seeds,
-        dp_sync_state=None,
+        dp_sync=None,
         dummy_run=False,
         skip_attn_for_dummy_run=False,
         mm_inputs=None,
