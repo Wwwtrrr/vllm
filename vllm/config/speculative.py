@@ -69,7 +69,12 @@ NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "leagle",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -626,6 +631,7 @@ class SpeculativeConfig:
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = self.method in (
             "eagle3",
+            "leagle",
             "extract_hidden_states",
             "dflash",
             "dspark",
@@ -1138,6 +1144,9 @@ class SpeculativeConfig:
             )
             self.method = "mtp"
 
+        if self.method == "leagle" and self.model is None:
+            raise ValueError("method='leagle' requires a LEAGLE checkpoint model")
+
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":
                 if self.target_model_config is None:
@@ -1318,7 +1327,7 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in ("eagle", "eagle3", "leagle", "dflash", "dspark"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1939,7 +1948,7 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        return self.method in ("eagle", "eagle3", "leagle", "mtp", "dflash", "dspark")
 
     def use_eagle_block_drop(self) -> bool:
         """Whether volatile trailing cache blocks should be discarded."""

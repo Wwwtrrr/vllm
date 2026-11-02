@@ -12,6 +12,42 @@ def register_speculator(name):
     return decorator
 
 
+@register_speculator("leagle")
+def update_leagle(config_dict: dict, pre_trained_config: dict) -> None:
+    """Preserve the LEAGLE training architecture and HF hidden-state indices."""
+    decoder = dict(pre_trained_config)
+    if decoder.get("model_type", "qwen3") != "qwen3":
+        raise ValueError("LEAGLE requires a Qwen3 draft decoder")
+    layers = config_dict.get("aux_hidden_state_layer_ids")
+    if (
+        not isinstance(layers, list)
+        or not layers
+        or any(type(i) is not int or i < 0 for i in layers)
+        or len(set(layers)) != len(layers)
+    ):
+        raise ValueError("LEAGLE requires distinct nonnegative auxiliary layer IDs")
+    loops = config_dict.get("num_loops", 1)
+    if type(loops) is not int or loops < 1:
+        raise ValueError("LEAGLE num_loops must be a positive integer")
+    vocab = config_dict.get("draft_vocab_size", 32000)
+    if type(vocab) is not int or vocab < 1:
+        raise ValueError("LEAGLE draft_vocab_size must be a positive integer")
+    pre_trained_config.update(
+        architectures=["LEagleDraftModel"],
+        draft_vocab_size=vocab,
+        num_loops=loops,
+        norm_output=config_dict.get("norm_output", True),
+        eagle_aux_hidden_state_layer_ids=sorted(layers),
+        leagle_config={
+            "transformer_layer_config": decoder,
+            "aux_hidden_state_layer_ids": list(layers),
+            "num_loops": loops,
+            "norm_output": config_dict.get("norm_output", True),
+            "draft_vocab_size": vocab,
+        },
+    )
+
+
 @register_speculator("eagle3")
 def update_eagle3(config_dict: dict, pre_trained_config: dict) -> None:
     """Apply Eagle-3 specific configuration transformations to the `dict` used to

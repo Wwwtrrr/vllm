@@ -699,6 +699,10 @@ class VllmConfig:
 
     @property
     def use_v2_model_runner(self) -> bool:
+        if self.speculative_config and self.speculative_config.method == "leagle":
+            if envs.VLLM_USE_V2_MODEL_RUNNER is False:
+                raise ValueError("LEAGLE requires VLLM_USE_V2_MODEL_RUNNER=1")
+            return True
         if self.attention_config.hisparse_config is not None:
             if envs.VLLM_USE_V2_MODEL_RUNNER is False:
                 raise ValueError(
@@ -3122,6 +3126,8 @@ class VllmConfig:
         if self.speculative_config:
             if self.speculative_config.method == "dspark":
                 unsupported.append("dspark speculative decoding")
+            if self.speculative_config.method == "leagle":
+                unsupported.append("leagle speculative decoding")
             if self.speculative_config.enable_adaptive_verification:
                 unsupported.append("adaptive draft verification")
 
