@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Eager LEAGLE inference matching speculators.models.leagle checkpoints."""
+"""LEAGLE inference matching speculators.models.leagle checkpoints."""
 
 from collections.abc import Iterable
 
@@ -94,7 +94,7 @@ class LEagleDecoderLayer(nn.Module):
 
 
 class LEagleDraftModel(nn.Module):
-    """Single-device eager drafter; physical decoder weights are shared by loops."""
+    """Single-device drafter; physical decoder weights are shared by loops."""
 
     def __init__(self, *, vllm_config, prefix: str = ""):
         super().__init__()
@@ -149,6 +149,79 @@ class LEagleDraftModel(nn.Module):
 
     def project_context(self, features):
         return self.hidden_norm(self.fc(features))
+
+    def validate_static_rollout(self):
+        rope_type = self.rotary_emb.rope_type
+        if "dynamic" in rope_type or rope_type == "longrope":
+            raise ValueError("LEAGLE FULL requires RoPE without runtime cache resizing")
+
+    @torch.inference_mode()
+    def propose_static(self, context, context_lengths, anchor_token, num_tokens: int):
+        """Fixed-shape rollout for FULL capture; lengths remain device tensors.
+
+        Context padding may contain stale rejected features. It is excluded at
+        every logical depth, including sliding attention. Draft KV is rebuilt
+        inside each replay and never carries state between proposal rounds.
+        """
+        batch, capacity, width = context.shape
+        positions = torch.arange(capacity, device=context.device)[None].expand(
+            batch, -1
+        )
+        context_rope = self.rotary_emb(context, positions)
+        context_kvs = [
+            layer.self_attn.project_context(context, context_rope)
+            for layer in self.layers
+        ]
+        state_index = (context_lengths - 1).view(batch, 1, 1).expand(-1, 1, width)
+        state = context.gather(1, state_index)
+        token = anchor_token.long()
+        caches = [None] * (len(self.layers) * self.num_loops)
+        proposals = []
+        context_visible = positions < context_lengths[:, None]
+        for step in range(num_tokens):
+            hidden = self.input_fc(
+                torch.cat(
+                    (self.embed_norm(self.embed_tokens(token)), self.state_norm(state)),
+                    dim=-1,
+                )
+            )
+            query_position = context_lengths[:, None] + step
+            rope = self.rotary_emb(hidden, query_position)
+            draft_positions = (
+                context_lengths[:, None]
+                + torch.arange(step + 1, device=context.device)[None]
+            )
+            key_positions = torch.cat((positions, draft_positions), dim=-1)
+            visible = torch.cat(
+                (
+                    context_visible,
+                    torch.ones(
+                        (batch, step + 1), dtype=torch.bool, device=context.device
+                    ),
+                ),
+                dim=-1,
+            )
+            for loop in range(self.num_loops):
+                for index, layer in enumerate(self.layers):
+                    depth = loop * len(self.layers) + index
+                    window = layer.self_attn.sliding_window
+                    mask = visible
+                    if window is not None:
+                        mask = mask & (key_positions > query_position - window)
+                    hidden, caches[depth] = layer(
+                        hidden,
+                        context_kvs[index],
+                        rope,
+                        caches[depth],
+                        mask[:, None, None, :],
+                    )
+            normalized = self.norm(hidden)
+            token = self.lm_head(normalized).argmax(-1)
+            if self.use_draft_vocab:
+                token = token + self.d2t[token]
+            state = normalized if self.norm_output else hidden
+            proposals.append(token)
+        return torch.cat(proposals, dim=1)
 
     @torch.inference_mode()
     def propose_context(self, context, anchor_token, num_tokens: int):

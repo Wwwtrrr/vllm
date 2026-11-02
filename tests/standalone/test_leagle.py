@@ -14,6 +14,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -37,6 +38,12 @@ context_module = load_file(
 algos = load_file(
     "leagle_algos", "vllm/transformers_utils/configs/speculators/algos.py"
 )
+graph_base = ModuleType("vllm.v1.worker.gpu.cudagraph_utils")
+graph_base.CudaGraphManager = type("CudaGraphManager", (), {})
+with patch.dict(sys.modules, {graph_base.__name__: graph_base}):
+    graph_module = load_file(
+        "leagle_graph", "vllm/v1/worker/gpu/spec_decode/leagle/graph.py"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -176,6 +183,7 @@ def runtime(monkeypatch):
         "vllm.v1.worker.gpu.spec_decode.leagle.context": {
             "LEagleContext": context_module.LEagleContext,
         },
+        "vllm.v1.worker.gpu.spec_decode.leagle.graph": vars(graph_module),
         "vllm.v1.worker.gpu.spec_decode.speculator": {"DraftModelSpeculator": object},
     }
     for name, attributes in dependencies.items():
@@ -206,7 +214,8 @@ def test_proposer_accepts_actual_runner_profile_and_decode_calls(runtime):
         )
 
 
-def test_proposer_uses_verified_prefix_and_bonus_anchor(runtime):
+@pytest.mark.parametrize("full_draft", [False, True])
+def test_proposer_uses_verified_prefix_and_bonus_anchor(runtime, full_draft):
     proposer = runtime.LEagleSpeculator.__new__(runtime.LEagleSpeculator)
     proposer.model = make_model(architecture())
     proposer.device = torch.device("cpu")
@@ -216,6 +225,15 @@ def test_proposer_uses_verified_prefix_and_bonus_anchor(runtime):
     proposer.context = context_module.LEagleContext(
         2, 32, 16, dtype=torch.float32, device="cpu"
     )
+    proposer.full_draft = full_draft
+    if full_draft:
+        inputs = graph_module.LEagleGraphInputs.allocate(
+            proposer.model, 32, 16, dtype=torch.float32, device="cpu"
+        )
+        proposer.graph_runner = graph_module.LEagleGraphRunner(
+            proposer.model, inputs, 3, CPUReplayBackend()
+        )
+        proposer.graph_runner.capture()
     anchor = torch.tensor([[3], [7]])
     history = []
 
@@ -255,6 +273,9 @@ def test_proposer_uses_verified_prefix_and_bonus_anchor(runtime):
     torch.testing.assert_close(
         output, proposer.model.propose_context(context, anchor[1:], 3)
     )
+    if full_draft:
+        assert proposer.graph_runner.proposal_replays == 2
+        assert proposer.graph_runner.projection_replays == 3
 
 
 def runtime_config():
@@ -283,7 +304,7 @@ def runtime_config():
     "path,value,message",
     [
         ("use_v2_model_runner", False, "Runner V2"),
-        ("model_config.enforce_eager", False, "enforce-eager"),
+        ("model_config.enforce_eager", False, "FULL"),
         ("cache_config.enable_prefix_caching", True, "prefix-caching"),
         ("parallel_config.tensor_parallel_size", 2, "TP=PP"),
         (
@@ -310,6 +331,154 @@ def test_unsupported_runtime_fails_explicitly(runtime, path, value, message):
     setattr(parent, name, value)
     with pytest.raises(ValueError, match=message):
         runtime.validate_leagle_runtime(config)
+
+
+def test_full_target_and_draft_configuration_is_accepted(runtime):
+    config = runtime_config()
+    config.model_config.enforce_eager = False
+    config.compilation_config = SimpleNamespace(
+        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True)
+    )
+    runtime.validate_leagle_runtime(config)
+    config.compilation_config.cudagraph_mode.has_full_cudagraphs = lambda: False
+    with pytest.raises(ValueError, match="FULL"):
+        runtime.validate_leagle_runtime(config)
+
+
+class CPUReplayBackend:
+    """Exercise buffer/replay orchestration; this is not a hardware graph."""
+
+    def __init__(self):
+        self.captures = 0
+
+    def capture(self, forward):
+        self.captures += 1
+        output = forward().clone()
+        return SimpleNamespace(replay=lambda: output.copy_(forward())), output
+
+
+@pytest.mark.parametrize("loops,window,reduced", [(1, None, False), (3, 4, True)])
+def test_static_rollout_matches_eager_for_different_lengths_and_stale_padding(
+    loops, window, reduced
+):
+    model = make_model(architecture(2, loops, reduced=reduced, window=window))
+    if reduced:
+        model.d2t.copy_(torch.arange(12))
+    context = torch.randn(3, 16, 16)
+    lengths = torch.tensor([9, 3, 1])
+    anchor = torch.tensor([[2], [5], [7]])
+    expected = torch.cat(
+        [
+            model.propose_context(
+                context[row : row + 1, :length], anchor[row : row + 1], 7
+            )
+            for row, length in enumerate(lengths.tolist())
+        ]
+    )
+    for row, length in enumerate(lengths.tolist()):
+        context[row, length:] = torch.randn_like(context[row, length:]) * 1000
+    # Graph code must not synchronize device values to the host.
+    with patch.object(torch.Tensor, "item", side_effect=AssertionError("host read")):
+        actual = model.propose_static(context, lengths, anchor, 7)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_graph_replay_updates_lengths_features_and_anchors_without_recapture():
+    model = make_model(architecture(2, 3, window=4))
+    inputs = graph_module.LEagleGraphInputs.allocate(
+        model, 257, 17, dtype=torch.float32, device="cpu"
+    )
+    backend = CPUReplayBackend()
+    manager = graph_module.LEagleGraphRunner(model, inputs, 7, backend)
+    context = torch.randn(1, 129, 16)
+    anchor = torch.tensor([[3]])
+    with pytest.raises(RuntimeError, match="not captured"):
+        manager.propose(context, anchor, 7)
+    manager.capture()
+    captures = backend.captures
+    pointers = (
+        inputs.context.data_ptr(),
+        inputs.features.data_ptr(),
+        inputs.anchor.data_ptr(),
+    )
+    for length, token in [(129, 3), (1, 6), (257, 7), (5, 2)]:
+        context = torch.randn(1, length, 16)
+        anchor.fill_(token)
+        expected = model.propose_context(context, anchor, 7)
+        torch.testing.assert_close(manager.propose(context, anchor, 7), expected)
+        features = torch.randn(3, 32)
+        torch.testing.assert_close(
+            manager.project_context(features), model.project_context(features)
+        )
+    assert manager.proposal_replays == manager.projection_replays == 4
+    manager.capture()
+    assert backend.captures == captures
+    assert pointers == (
+        inputs.context.data_ptr(),
+        inputs.features.data_ptr(),
+        inputs.anchor.data_ptr(),
+    )
+    with pytest.raises(ValueError, match="capacity"):
+        manager.propose(torch.zeros(1, 258, 16), anchor, 7)
+    with pytest.raises(ValueError, match="length"):
+        manager.propose(context, anchor, 8)
+    with pytest.raises(ValueError, match="capacity"):
+        manager.project_context(torch.zeros(18, 32))
+
+
+def test_graph_manager_can_be_recreated_after_memory_profiling(runtime):
+    proposer = runtime.LEagleSpeculator.__new__(runtime.LEagleSpeculator)
+    proposer.full_draft = True
+    proposer.model = make_model(architecture())
+    proposer.num_speculative_steps = 3
+    proposer.graph_inputs = graph_module.LEagleGraphInputs.allocate(
+        proposer.model, 8, 4, dtype=torch.float32, device="cpu"
+    )
+    proposer.create_graph_backend = CPUReplayBackend
+    mode = SimpleNamespace(has_full_cudagraphs=lambda: True)
+    proposer.init_cudagraph_manager(mode)
+    proposer.capture()
+    assert isinstance(proposer.graph_runner, graph_base.CudaGraphManager)
+    assert not proposer.graph_runner.needs_capture()
+    inputs = proposer.graph_inputs
+    proposer.graph_runner = None  # Framework profiling teardown.
+    proposer.init_cudagraph_manager(mode)
+    proposer.capture()
+    assert proposer.graph_inputs is inputs
+    assert proposer.graph_runner.proposal_replays == 0
+
+
+def test_full_draft_workspace_is_profiled_without_target_kv(runtime):
+    proposer = runtime.LEagleSpeculator.__new__(runtime.LEagleSpeculator)
+    proposer.full_draft = True
+    proposer.num_speculative_steps = 3
+    proposer.draft_tokens = torch.zeros((1, 3), dtype=torch.long)
+    proposer.model = make_model(architecture())
+    proposer.graph_inputs = graph_module.LEagleGraphInputs.allocate(
+        proposer.model, 8, 4, dtype=torch.float32, device="cpu"
+    )
+    calls = []
+    handle = proposer.model.lm_head.register_forward_hook(
+        lambda *_args: calls.append(True)
+    )
+    proposer.propose(
+        SimpleNamespace(num_reqs=1),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        dummy_run=True,
+        skip_attn_for_dummy_run=True,
+        is_profile=True,
+    )
+    handle.remove()
+    assert len(calls) == 3
 
 
 @pytest.mark.parametrize(
@@ -390,4 +559,15 @@ def test_logits_match_real_training_code(
     handle.remove()
     torch.testing.assert_close(actual, expected)
     tolerance = {"atol": 2e-6, "rtol": 2e-5} if dtype == torch.float32 else {}
+    torch.testing.assert_close(torch.cat(actual_logits, 1), logits, **tolerance)
+    # The same real training logits must hold with padded static graph inputs.
+    actual_logits.clear()
+    padded = torch.randn(1, 16, 16, dtype=dtype) * 100
+    padded[:, :9] = inference.project_context(features)
+    handle = inference.lm_head.register_forward_hook(
+        lambda _module, _args, output: actual_logits.append(output)
+    )
+    actual = inference.propose_static(padded, torch.tensor([9]), anchor, 7)
+    handle.remove()
+    torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(torch.cat(actual_logits, 1), logits, **tolerance)

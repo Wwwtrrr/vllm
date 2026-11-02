@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reference LEAGLE proposer for Model Runner V2 (CUDA and Ascend)."""
+"""LEAGLE proposer for Model Runner V2 (CUDA and Ascend)."""
 
 import torch
 from transformers import Qwen3Config
@@ -8,6 +8,11 @@ from transformers import Qwen3Config
 from vllm.compilation.backends import set_model_tag
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.spec_decode.leagle.context import LEagleContext
+from vllm.v1.worker.gpu.spec_decode.leagle.graph import (
+    LEagleGraphInputs,
+    LEagleGraphRunner,
+    NativeLEagleGraphBackend,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 
@@ -16,11 +21,14 @@ def validate_leagle_runtime(config):
     parallel = config.parallel_config
     if not config.use_v2_model_runner:
         raise ValueError("LEAGLE requires Model Runner V2")
-    if (
-        not config.model_config.enforce_eager
-        or getattr(spec, "enforce_eager", None) is False
-    ):
-        raise ValueError("LEAGLE currently requires --enforce-eager")
+    if config.model_config.enforce_eager:
+        if getattr(spec, "enforce_eager", None) is False:
+            raise ValueError("LEAGLE draft FULL requires target FULL capture enabled")
+    else:
+        compilation = getattr(config, "compilation_config", None)
+        mode = getattr(compilation, "cudagraph_mode", None)
+        if mode is None or not mode.has_full_cudagraphs():
+            raise ValueError("LEAGLE requires eager execution or a FULL graph mode")
     if any(
         getattr(parallel, name, 1) != 1
         for name in (
@@ -72,6 +80,12 @@ class LEagleSpeculator(DraftModelSpeculator):
         super().__init__(vllm_config, device)
         self.draft_attn_layer_names: set[str] = set()
         self.attn_groups = []
+        self.full_draft = (
+            not vllm_config.model_config.enforce_eager
+            and self.speculative_config.enforce_eager is not True
+        )
+        self.graph_inputs = None
+        self.graph_runner = None
         self.context = LEagleContext(
             self.max_num_reqs,
             self.max_model_len,
@@ -89,6 +103,14 @@ class LEagleSpeculator(DraftModelSpeculator):
 
     def load_model(self, target_model):
         self.model = self.load_draft_model(target_model, set()).eval()
+        if self.full_draft:
+            self.graph_inputs = LEagleGraphInputs.allocate(
+                self.model,
+                self.max_model_len,
+                self.max_num_tokens,
+                dtype=self.dtype,
+                device=self.device,
+            )
 
     def set_attn(
         self,
@@ -106,10 +128,28 @@ class LEagleSpeculator(DraftModelSpeculator):
         self.target_attn_groups = target_attn_groups
 
     def init_cudagraph_manager(self, cudagraph_mode):
-        pass
+        if not self.full_draft:
+            self.graph_runner = None
+            return
+        if not cudagraph_mode.has_full_cudagraphs():
+            raise ValueError("Target backend disabled FULL graphs required by LEAGLE")
+        if self.graph_inputs is None:
+            raise RuntimeError("LEAGLE graph inputs must be allocated before profiling")
+        self.graph_runner = LEagleGraphRunner(
+            self.model,
+            self.graph_inputs,
+            self.num_speculative_steps,
+            self.create_graph_backend(),
+        )
+
+    def create_graph_backend(self):
+        if self.device.type != "cuda":
+            raise ValueError("Use the Ascend LEAGLE speculator for NPU graph capture")
+        return NativeLEagleGraphBackend(torch.cuda, self.device, torch.cuda.CUDAGraph)
 
     def capture(self):
-        pass
+        if self.graph_runner is not None:
+            self.graph_runner.capture()
 
     @torch.inference_mode()
     def propose(
@@ -140,12 +180,24 @@ class LEagleSpeculator(DraftModelSpeculator):
         self.draft_tokens.fill_(-1)
         result = self.draft_tokens[: input_batch.num_reqs]
         if dummy_run:
-            if not skip_attn_for_dummy_run and count:
-                length = max(1, self.max_model_len - count)
-                anchor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-                self.model.propose_context(
-                    self.context.values[:1, :length], anchor, count
-                )
+            if (not skip_attn_for_dummy_run or is_profile) and count:
+                if getattr(self, "full_draft", False):
+                    # Include both persistent inputs and graph-shaped operator
+                    # workspace before the framework budgets target KV memory.
+                    projected = self.model.project_context(self.graph_inputs.features)
+                    self.model.propose_static(
+                        self.graph_inputs.context,
+                        self.graph_inputs.lengths,
+                        self.graph_inputs.anchor,
+                        self.num_speculative_steps,
+                    )
+                    del projected
+                else:
+                    length = max(1, self.max_model_len - count)
+                    anchor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+                    self.model.propose_context(
+                        self.context.values[:1, :length], anchor, count
+                    )
             return result
         if aux_hidden_states is None:
             raise ValueError("LEAGLE requires target auxiliary hidden states")
@@ -156,8 +208,14 @@ class LEagleSpeculator(DraftModelSpeculator):
         features = torch.cat(
             [aux_hidden_states[capture_order.index(layer)] for layer in layers], dim=-1
         )
-        projected = self.model.project_context(features)
-        # Eager reference path: synchronize verdicts and positions once per batch.
+        full_draft = getattr(self, "full_draft", False)
+        if full_draft:
+            if self.graph_runner is None:
+                raise RuntimeError("LEAGLE FULL graph manager is not initialized")
+            projected = self.graph_runner.project_context(features)
+        else:
+            projected = self.model.project_context(features)
+        # Schedule/stage outside graphs: synchronize verdicts/positions once.
         rejected = num_rejected.cpu().tolist()
         sampled = num_sampled.cpu().tolist()
         positions = input_batch.positions.cpu().tolist()
@@ -173,6 +231,10 @@ class LEagleSpeculator(DraftModelSpeculator):
             context = self.context.update(slot, req_id, start, projected[begin:end])
             if sampled[row] and count:
                 anchor = last_sampled[slot : slot + 1, :1]
-                tokens = self.model.propose_context(context, anchor, count)
+                tokens = (
+                    self.graph_runner.propose(context, anchor, count)
+                    if full_draft
+                    else self.model.propose_context(context, anchor, count)
+                )
                 result[row, :count].copy_(tokens[0])
         return result
