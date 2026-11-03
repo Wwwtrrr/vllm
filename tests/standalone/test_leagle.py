@@ -93,6 +93,55 @@ def test_config_preserves_training_geometry_and_feature_order():
     assert converted["architectures"] == ["LEagleDraftModel"]
 
 
+@pytest.mark.parametrize("norm", [True, False])
+def test_public_forward_recurs_with_immutable_logical_depth_caches(norm):
+    model = make_model(architecture(2, 3, norm=norm))
+    context = torch.randn(1, 5, 16)
+    anchor = torch.tensor([[3]])
+    positions = torch.arange(5)[None]
+    rope = model.rotary_emb(context, positions)
+    context_kvs = [
+        layer.self_attn.project_context(context, rope) for layer in model.layers
+    ]
+    first = model(
+        anchor,
+        torch.tensor([[5]]),
+        hidden_states=context[:, -1:],
+        context_kvs=context_kvs,
+        attention_masks={None: None},
+    )
+    token = model.compute_logits(first.hidden_states).argmax(-1)
+    snapshot = [(key.clone(), value.clone()) for key, value in first.past_draft_kv]
+    second = model(
+        token,
+        torch.tensor([[6]]),
+        hidden_states=first.recurrent_state,
+        context_kvs=context_kvs,
+        attention_masks={None: None},
+        past_draft_kv=first.past_draft_kv,
+    )
+    assert len(second.past_draft_kv) == 6
+    for before, original, updated in zip(
+        snapshot, first.past_draft_kv, second.past_draft_kv
+    ):
+        for saved, previous, current in zip(before, original, updated):
+            torch.testing.assert_close(saved, previous)
+            assert previous.shape[-2] == 1 and current.shape[-2] == 2
+    expected = torch.cat(
+        (token, model.compute_logits(second.hidden_states).argmax(-1)), 1
+    )
+    calls = []
+    handle = model.register_forward_hook(lambda *_args: calls.append(True))
+    actual = model.propose_context(context, anchor, 2)
+    torch.testing.assert_close(actual, expected)
+    assert len(calls) == 2
+    calls.clear()
+    actual = model.propose_static(context, torch.tensor([5]), anchor, 2)
+    handle.remove()
+    torch.testing.assert_close(actual, expected)
+    assert len(calls) == 2
+
+
 def test_saved_speculators_config_selects_leagle_without_mutating_checkpoint(
     monkeypatch,
 ):

@@ -28,6 +28,19 @@ during a proposal round. Context K/V projections are reused by all loops and
 draft token steps in that round. Rejected target positions are excluded from
 the next round; partial prefills accumulate context without emitting proposals.
 
+Both eager and FULL rollouts call the same public single-step `model(...)`
+interface. `forward(input_ids, positions, *, hidden_states, context_kvs,
+attention_masks, past_draft_kv=None)` returns `LEagleForwardOutput` containing
+normalized `hidden_states` for `compute_logits`, `recurrent_state` for the next
+token, and immutable `past_draft_kv` per logical `(loop, layer)`. Context K/V is
+prepared once per proposal round. The caller provides visibility masks and
+performs token selection after `compute_logits`.
+
+This interface requires LEAGLE-specific context and recurrent state. Serving
+still uses `LEagleSpeculator`; this does not turn the drafter into a standalone
+language model or enable generic EAGLE3 paged attention. Checkpoint tensor names
+and FULL graph boundaries are unchanged by the single-step interface.
+
 The implementation uses Model Runner V2, PyTorch SDPA, a Qwen3 target,
 TP=PP=DCP=PCP=1, and greedy draft proposals. Target sampling still uses
 vLLM's normal verifier/rejection sampler; greedy draft probabilities are one-hot.

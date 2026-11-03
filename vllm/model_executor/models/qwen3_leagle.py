@@ -3,6 +3,7 @@
 """LEAGLE inference matching speculators.models.leagle checkpoints."""
 
 from collections.abc import Iterable
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -22,6 +23,12 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     return x * cos.unsqueeze(1) + _rotate_half(x) * sin.unsqueeze(1)
+
+
+class LEagleForwardOutput(NamedTuple):
+    hidden_states: torch.Tensor
+    recurrent_state: torch.Tensor
+    past_draft_kv: tuple
 
 
 class LEagleAttention(nn.Module):
@@ -144,8 +151,67 @@ class LEagleDraftModel(nn.Module):
     def compute_logits(self, hidden_states):
         return self.lm_head(hidden_states)
 
-    def forward(self, input_ids, positions, **kwargs):
-        raise RuntimeError("LEAGLE must run through LEagleSpeculator.propose")
+    def forward(
+        self,
+        input_ids,
+        positions,
+        *,
+        hidden_states,
+        context_kvs,
+        attention_masks,
+        past_draft_kv=None,
+    ) -> LEagleForwardOutput:
+        """Advance one draft token through every shared decoder loop.
+
+        Args:
+            input_ids: Known target-vocabulary token IDs, shaped [B, 1].
+            positions: Absolute token positions, shaped [B, 1].
+            hidden_states: Previous recurrent state, shaped [B, 1, H].
+            context_kvs: Immutable target K/V pair per physical layer.
+            attention_masks: SDPA mask per attention window, including None
+                for full attention. Padding and trajectory visibility are
+                supplied by the caller rather than inferred from tensor values.
+            past_draft_kv: Draft K/V per logical (loop, layer), or None on
+                the first step. Inputs are never modified in place.
+
+        Returns:
+            Normalized hidden states for compute_logits, next recurrent state,
+            and updated draft K/V. Sampling remains the caller's responsibility.
+
+        """
+        depth_count = len(self.layers) * self.num_loops
+        if len(context_kvs) != len(self.layers):
+            raise ValueError("LEAGLE requires one context K/V pair per physical layer")
+        if past_draft_kv is None:
+            past_draft_kv = (None,) * depth_count
+        elif len(past_draft_kv) != depth_count:
+            raise ValueError("LEAGLE draft K/V must index every (loop, layer)")
+        hidden = self.input_fc(
+            torch.cat(
+                (
+                    self.embed_norm(self.embed_input_ids(input_ids)),
+                    self.state_norm(hidden_states),
+                ),
+                dim=-1,
+            )
+        )
+        rope = self.rotary_emb(hidden, positions)
+        next_kv = []
+        for loop in range(self.num_loops):
+            for index, layer in enumerate(self.layers):
+                depth = loop * len(self.layers) + index
+                hidden, present = layer(
+                    hidden,
+                    context_kvs[index],
+                    rope,
+                    past_draft_kv[depth],
+                    attention_masks[layer.self_attn.sliding_window],
+                )
+                next_kv.append(present)
+        normalized = self.norm(hidden)
+        return LEagleForwardOutput(
+            normalized, normalized if self.norm_output else hidden, tuple(next_kv)
+        )
 
     def project_context(self, features):
         return self.hidden_norm(self.fc(features))
@@ -179,14 +245,7 @@ class LEagleDraftModel(nn.Module):
         proposals = []
         context_visible = positions < context_lengths[:, None]
         for step in range(num_tokens):
-            hidden = self.input_fc(
-                torch.cat(
-                    (self.embed_norm(self.embed_tokens(token)), self.state_norm(state)),
-                    dim=-1,
-                )
-            )
             query_position = context_lengths[:, None] + step
-            rope = self.rotary_emb(hidden, query_position)
             draft_positions = (
                 context_lengths[:, None]
                 + torch.arange(step + 1, device=context.device)[None]
@@ -201,25 +260,25 @@ class LEagleDraftModel(nn.Module):
                 ),
                 dim=-1,
             )
-            for loop in range(self.num_loops):
-                for index, layer in enumerate(self.layers):
-                    depth = loop * len(self.layers) + index
-                    window = layer.self_attn.sliding_window
-                    mask = visible
-                    if window is not None:
-                        mask = mask & (key_positions > query_position - window)
-                    hidden, caches[depth] = layer(
-                        hidden,
-                        context_kvs[index],
-                        rope,
-                        caches[depth],
-                        mask[:, None, None, :],
-                    )
-            normalized = self.norm(hidden)
-            token = self.lm_head(normalized).argmax(-1)
+            masks = {}
+            for layer in self.layers:
+                window = layer.self_attn.sliding_window
+                mask = visible
+                if window is not None:
+                    mask = mask & (key_positions > query_position - window)
+                masks[window] = mask[:, None, None, :]
+            output = self(
+                token,
+                query_position,
+                hidden_states=state,
+                context_kvs=context_kvs,
+                attention_masks=masks,
+                past_draft_kv=caches,
+            )
+            token = self.compute_logits(output.hidden_states).argmax(-1)
             if self.use_draft_vocab:
                 token = token + self.d2t[token]
-            state = normalized if self.norm_output else hidden
+            state, caches = output.recurrent_state, output.past_draft_kv
             proposals.append(token)
         return torch.cat(proposals, dim=1)
 
@@ -241,36 +300,32 @@ class LEagleDraftModel(nn.Module):
         state, token = context[:, -1:], anchor_token.long()
         proposals = []
         for step in range(num_tokens):
-            hidden = self.input_fc(
-                torch.cat(
-                    (self.embed_norm(self.embed_tokens(token)), self.state_norm(state)),
-                    dim=-1,
-                )
-            )
             query_position = positions[:, -1:] + 1 + step
-            rope = self.rotary_emb(hidden, query_position)
             key_positions = torch.arange(
                 context.shape[1] + step + 1, device=context.device
             )
-            for loop in range(self.num_loops):
-                for index, layer in enumerate(self.layers):
-                    depth = loop * len(self.layers) + index
-                    window = layer.self_attn.sliding_window
-                    mask = (
-                        None
-                        if window is None
-                        else (
-                            key_positions > query_position[..., None] - window
-                        ).unsqueeze(1)
+            masks = {}
+            for layer in self.layers:
+                window = layer.self_attn.sliding_window
+                masks[window] = (
+                    None
+                    if window is None
+                    else (key_positions > query_position[..., None] - window).unsqueeze(
+                        1
                     )
-                    hidden, caches[depth] = layer(
-                        hidden, context_kvs[index], rope, caches[depth], mask
-                    )
-            normalized = self.norm(hidden)
-            token = self.lm_head(normalized).argmax(-1)
+                )
+            output = self(
+                token,
+                query_position,
+                hidden_states=state,
+                context_kvs=context_kvs,
+                attention_masks=masks,
+                past_draft_kv=caches,
+            )
+            token = self.compute_logits(output.hidden_states).argmax(-1)
             if self.use_draft_vocab:
                 token = token + self.d2t[token]
-            state = normalized if self.norm_output else hidden
+            state, caches = output.recurrent_state, output.past_draft_kv
             proposals.append(token)
         return torch.cat(proposals, dim=1)
 
