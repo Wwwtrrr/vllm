@@ -573,10 +573,63 @@ def test_optimized_serving_matches_reference_across_requests_and_rounds(
     run([(2, "a", 5, 2, 1, 1), (0, "b", 4, 3, 0, 1)])
     if full:
         assert proposer.graph_runner.proposal_replays == (4 if batch else 8)
+        assert proposer.graph_runner.update_replays == 9
     if reuse:
         # Exactly one projection of the new batch per round, never a projection
         # of complete request prefixes from inside the autoregressive rollout.
         assert len(projected_sizes) == 4
+
+
+@torch.inference_mode()
+def test_cache_graph_padding_and_recapture_preserve_live_requests():
+    model = make_model(architecture(2, 2, window=4))
+    context = context_module.LEagleContext(3, 16, 16, dtype=torch.float32, device="cpu")
+    execution = execution_module.LEagleExecution(
+        model,
+        context,
+        16,
+        3,
+        execution_module.LEagleExecutionOptions(),
+        dtype=torch.float32,
+        device="cpu",
+    )
+    context.values.fill_(13)
+    for pair in execution.prefix_kv:
+        for tensor in pair:
+            tensor.fill_(17)
+    manager = execution_module.LEagleOptimizedGraphRunner(
+        execution, TreeCPUReplayBackend()
+    )
+    manager.capture()
+    assert (context.values == 13).all()
+    assert all((tensor == 17).all() for pair in execution.prefix_kv for tensor in pair)
+    features = torch.randn(16, 32)
+    # The 9 valid source tokens occupy the end of the buffer; padding must not
+    # read beyond that buffer or write to another live request.
+    execution.project(features, torch.arange(16), manager)
+    expected_features = execution.projected[7:16].clone()
+    expected_kv = tuple(
+        tuple(t[:, :, 7:16].clone() for t in pair) for pair in execution.new_kv
+    )
+    execution.update(2, "request", 0, 7, 16, manager)
+    torch.testing.assert_close(context.values[2, :9], expected_features)
+    assert (context.values[:2] == 13).all()
+    assert (context.values[2, 9:] == 13).all()
+    for cached, expected in zip(execution.prefix_kv, expected_kv):
+        for storage, value in zip(cached, expected):
+            torch.testing.assert_close(storage[2:3, :, :9], value)
+            assert (storage[:2] == 17).all()
+            assert (storage[2, :, 9:] == 17).all()
+    snapshot = context.values.clone()
+    kv_snapshot = tuple(tuple(t.clone() for t in pair) for pair in execution.prefix_kv)
+    manager = execution_module.LEagleOptimizedGraphRunner(
+        execution, TreeCPUReplayBackend()
+    )
+    manager.capture()
+    torch.testing.assert_close(context.values, snapshot)
+    for cached, expected in zip(execution.prefix_kv, kv_snapshot):
+        for storage, value in zip(cached, expected):
+            torch.testing.assert_close(storage, value)
 
 
 @pytest.mark.parametrize("loops,window,reduced", [(1, None, False), (3, 4, True)])

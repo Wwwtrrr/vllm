@@ -282,7 +282,14 @@ class LEagleSpeculator(DraftModelSpeculator):
                 raise ValueError("LEAGLE requires contiguous target positions")
             slot = int(input_batch.idx_mapping_np[row])
             context = (
-                execution.update(slot, req_id, start, begin, end)
+                execution.update(
+                    slot,
+                    req_id,
+                    start,
+                    begin,
+                    end,
+                    self.graph_runner if full_draft else None,
+                )
                 if execution is not None
                 else self.context.update(slot, req_id, start, projected[begin:end])
             )
