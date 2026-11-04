@@ -33,7 +33,8 @@ interface. `forward(input_ids, positions, *, hidden_states, context_kvs,
 attention_masks, past_draft_kv=None)` returns `LEagleForwardOutput` containing
 normalized `hidden_states` for `compute_logits`, `recurrent_state` for the next
 token, and immutable `past_draft_kv` per logical `(loop, layer)`. Context K/V is
-prepared once per proposal round. The caller provides visibility masks and
+prepared incrementally from verified target features by the serving executor.
+The caller provides visibility masks and
 performs token selection after `compute_logits`.
 
 This interface requires LEAGLE-specific context and recurrent state. Serving
@@ -60,7 +61,7 @@ draft `enforce_eager=true` keeps target FULL but runs the drafter eagerly.
 The target uses the framework's existing FULL capture and auxiliary hidden-state
 outputs. The draft captures target-feature FC/RMSNorm projection in token-count
 buckets, and complete K-token autoregressive rollouts in context-length buckets.
-Each rollout includes target K/V projection, all shared loops, draft KV, output
+Each rollout includes all shared loops, draft KV, output
 normalization, LM head, argmax and vocabulary mapping. Dynamic context lengths
 are device tensors; padding and rejected tail positions remain masked. RoPE
 variants that resize their cache at runtime are rejected for draft FULL.
@@ -75,9 +76,44 @@ Projected target features reserve
 small limits above. FULL adds one padded projected-context buffer and feature
 projection input/output buffers, plus graph-pool memory. Request scheduling,
 verdict/position synchronization and staging copies remain outside graphs.
-Requests are handled sequentially by the drafter; each K-token rollout is one
-FULL replay. Measure acceptance and output parity
+Requests are batched into batch-size and context-length buckets; each batch's
+K-token rollout is one FULL replay. Measure acceptance and output parity
 before using its latency as a serving benchmark.
+
+## Inference optimizations
+
+The following `speculative_config` switches default to `true` for LEAGLE:
+
+| Option | Behavior |
+| --- | --- |
+| `leagle_reuse_context_kv` | Project only newly verified target features into K/V, retaining each request's prefix across rounds. |
+| `leagle_static_draft_kv` | Preallocate logical-layer draft KV and physical-layer attention workspaces; avoid concatenating the full context at every draft step. |
+| `leagle_batch_drafts` | Draft active requests together with per-request positions and visibility masks. |
+| `leagle_fused_projections` | Pack Q/K/V, context K/V and MLP gate/up projections into fewer matrix multiplications. |
+| `leagle_fused_rmsnorm` | Use the device RMSNorm kernel instead of separate reduction/elementwise operations. |
+
+For an A/B comparison, set all five to `false` to select the reference executor.
+Keep the checkpoint, draft length, request limits and input workload identical.
+Both executors support eager and FULL. The optimized FULL projection graph also
+computes new target K/V; the rollout graph reads cached K/V and stages a padded
+batch. Autoregressive drafting still requires K token steps and all configured
+shared loops.
+
+Only verified target features enter the cross-round cache. Slot reuse, suffix
+rewinds, rejected tails and partial prefills follow the same context ledger as
+the reference path. Synthetic draft KV is rebuilt each round. Cached K/V also
+requires RoPE whose scaling does not change with runtime sequence length.
+
+These switches require no retraining or checkpoint conversion. Packed weights
+are nonpersistent buffers; original checkpoint names remain unchanged. Packing
+and fused kernels can change floating-point rounding, so evaluate acceptance
+and output quality with the actual checkpoint as well as token parity tests.
+Additional memory includes packed weights, persistent K/V per physical layer,
+batched attention workspaces, draft KV per logical layer and graph buckets.
+Increase `max_num_seqs` and `max_model_len` gradually while checking memory.
+This is dense cache execution, without paged attention or a fused attention
+kernel. Training-only chunked loss and DDP settings belong to the training
+repository and are not serving options.
 
 CPU contracts (no CUDA imports):
 

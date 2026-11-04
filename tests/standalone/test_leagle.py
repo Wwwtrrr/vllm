@@ -44,6 +44,16 @@ with patch.dict(sys.modules, {graph_base.__name__: graph_base}):
     graph_module = load_file(
         "leagle_graph", "vllm/v1/worker/gpu/spec_decode/leagle/graph.py"
     )
+with patch.dict(
+    sys.modules,
+    {
+        graph_base.__name__: graph_base,
+        "vllm.v1.worker.gpu.spec_decode.leagle.graph": graph_module,
+    },
+):
+    execution_module = load_file(
+        "leagle_execution", "vllm/v1/worker/gpu/spec_decode/leagle/execution.py"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -233,6 +243,7 @@ def runtime(monkeypatch):
             "LEagleContext": context_module.LEagleContext,
         },
         "vllm.v1.worker.gpu.spec_decode.leagle.graph": vars(graph_module),
+        "vllm.v1.worker.gpu.spec_decode.leagle.execution": vars(execution_module),
         "vllm.v1.worker.gpu.spec_decode.speculator": {"DraftModelSpeculator": object},
     }
     for name, attributes in dependencies.items():
@@ -404,6 +415,168 @@ class CPUReplayBackend:
         self.captures += 1
         output = forward().clone()
         return SimpleNamespace(replay=lambda: output.copy_(forward())), output
+
+
+class TreeCPUReplayBackend(CPUReplayBackend):
+    def capture(self, forward):
+        from torch.utils._pytree import tree_map
+
+        self.captures += 1
+        output = tree_map(lambda tensor: tensor.clone(), forward())
+        return SimpleNamespace(
+            replay=lambda: tree_map(
+                lambda target, value: target.copy_(value), output, forward()
+            )
+        ), output
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_packed_projections_preserve_logits_and_checkpoint_names(dtype):
+    reference = make_model(architecture(2, 2, window=4)).to(dtype=dtype)
+    optimized = copy.deepcopy(reference)
+    keys = set(optimized.state_dict())
+    optimized.configure_inference(fused_projections=True)
+    assert set(optimized.state_dict()) == keys
+    context = torch.randn(1, 7, 16, dtype=dtype)
+    anchor = torch.tensor([[3]])
+    expected_logits, actual_logits = [], []
+    reference.lm_head.register_forward_hook(
+        lambda _m, _a, value: expected_logits.append(value)
+    )
+    optimized.lm_head.register_forward_hook(
+        lambda _m, _a, value: actual_logits.append(value)
+    )
+    expected = reference.propose_context(context, anchor, 3)
+    actual = optimized.propose_context(context, anchor, 3)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        torch.cat(actual_logits, 1), torch.cat(expected_logits, 1)
+    )
+    with torch.no_grad():
+        reference.layers[0].self_attn.q_proj.weight.add_(0.1)
+    optimized.load_weights(reference.state_dict().items())
+    torch.testing.assert_close(
+        optimized.layers[0].self_attn._qkv_weight[:16],
+        reference.layers[0].self_attn.q_proj.weight,
+    )
+
+
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize(
+    "reuse,static,batch",
+    [
+        (True, True, True),
+        (False, True, True),
+        (True, False, True),
+        (True, True, False),
+        (False, False, False),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_optimized_serving_matches_reference_across_requests_and_rounds(
+    runtime, full, reuse, static, batch, dtype
+):
+    reference = make_model(architecture(2, 2, window=4)).to(dtype=dtype)
+    model = copy.deepcopy(reference)
+    model.configure_inference(fused_projections=True)
+    context = context_module.LEagleContext(3, 16, 16, dtype=dtype, device="cpu")
+    options = execution_module.LEagleExecutionOptions(
+        reuse_context_kv=reuse, static_draft_kv=static, batch_drafts=batch
+    )
+    execution = execution_module.LEagleExecution(
+        model, context, 16, 3, options, dtype=dtype, device="cpu"
+    )
+    proposer = runtime.LEagleSpeculator.__new__(runtime.LEagleSpeculator)
+    proposer.model, proposer.context, proposer.execution = model, context, execution
+    proposer.full_draft = full
+    proposer.num_speculative_steps = 3
+    proposer.draft_tokens = torch.empty(3, 3, dtype=torch.long)
+    proposer.graph_runner = None
+    if full:
+        proposer.graph_runner = execution_module.LEagleOptimizedGraphRunner(
+            execution, TreeCPUReplayBackend()
+        )
+        proposer.graph_runner.capture()
+    histories = {}
+    projected_sizes = []
+    prepare_context_kv = model.prepare_context_kv
+
+    def record_projection(context_values, position_values):
+        projected_sizes.append(context_values.shape[1])
+        return prepare_context_kv(context_values, position_values)
+
+    model.prepare_context_kv = record_projection
+    anchors = torch.tensor([[5], [7], [3]])
+
+    def run(rows):
+        aux, positions, boundaries = [], [], [0]
+        for slot, request_id, start, count, rejected, sampled in rows:
+            features = torch.randn(count, 32, dtype=dtype)
+            aux.append(features)
+            positions.extend(range(start, start + count))
+            boundaries.append(boundaries[-1] + count)
+            kept = count - rejected
+            if start == 0 or slot not in histories or histories[slot][0] != request_id:
+                histories[slot] = (request_id, features[:kept].clone())
+            else:
+                histories[slot] = (
+                    request_id,
+                    torch.cat((histories[slot][1][:start], features[:kept])),
+                )
+        features = torch.cat(aux)
+        # Capture order is sorted [0,1]; checkpoint feature order is [1,0].
+        batch_input = SimpleNamespace(
+            num_reqs=len(rows),
+            req_ids=[row[1] for row in rows],
+            idx_mapping_np=np.array([row[0] for row in rows]),
+            positions=torch.tensor(positions),
+            query_start_loc_np=np.array(boundaries),
+        )
+        output = proposer.propose(
+            batch_input,
+            {},
+            {},
+            None,
+            [features[:, 16:], features[:, :16]],
+            torch.tensor([row[5] for row in rows]),
+            torch.tensor([row[4] for row in rows]),
+            anchors,
+            None,
+            None,
+            None,
+        ).clone()
+        for index, (slot, request_id, start, count, rejected, sampled) in enumerate(
+            rows
+        ):
+            prefix = reference.project_context(histories[slot][1][None])
+            if sampled:
+                expected = reference.propose_context(
+                    prefix, anchors[slot : slot + 1], 3
+                )
+                torch.testing.assert_close(output[index : index + 1], expected)
+            else:
+                assert (output[index] == -1).all()
+            if reuse:
+                position = torch.arange(prefix.shape[1])[None]
+                kv = reference.prepare_context_kv(prefix, position)
+                for cached, expected_pair in zip(execution.prefix_kv, kv):
+                    for tensor, expected_value in zip(cached, expected_pair):
+                        torch.testing.assert_close(
+                            tensor[slot : slot + 1, :, : prefix.shape[1]],
+                            expected_value,
+                        )
+
+    run([(2, "a", 0, 4, 0, 1), (0, "b", 0, 2, 0, 0), (1, "c", 0, 3, 0, 1)])
+    run([(1, "c", 3, 4, 2, 1), (2, "a", 4, 4, 1, 1), (0, "b", 2, 2, 0, 1)])
+    run([(1, "replacement", 0, 1, 0, 1)])
+    # Rewind a suffix; neither accepted nor rejected synthetic draft KV is reused.
+    run([(2, "a", 5, 2, 1, 1), (0, "b", 4, 3, 0, 1)])
+    if full:
+        assert proposer.graph_runner.proposal_replays == (4 if batch else 8)
+    if reuse:
+        # Exactly one projection of the new batch per round, never a projection
+        # of complete request prefixes from inside the autoregressive rollout.
+        assert len(projected_sizes) == 4
 
 
 @pytest.mark.parametrize("loops,window,reduced", [(1, None, False), (3, 4, True)])

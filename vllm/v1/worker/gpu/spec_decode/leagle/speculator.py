@@ -8,6 +8,11 @@ from transformers import Qwen3Config
 from vllm.compilation.backends import set_model_tag
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.spec_decode.leagle.context import LEagleContext
+from vllm.v1.worker.gpu.spec_decode.leagle.execution import (
+    LEagleExecution,
+    LEagleExecutionOptions,
+    LEagleOptimizedGraphRunner,
+)
 from vllm.v1.worker.gpu.spec_decode.leagle.graph import (
     LEagleGraphInputs,
     LEagleGraphRunner,
@@ -86,6 +91,10 @@ class LEagleSpeculator(DraftModelSpeculator):
         )
         self.graph_inputs = None
         self.graph_runner = None
+        self.execution = None
+        self.execution_options = LEagleExecutionOptions.from_config(
+            self.speculative_config
+        )
         self.context = LEagleContext(
             self.max_num_reqs,
             self.max_model_len,
@@ -103,7 +112,22 @@ class LEagleSpeculator(DraftModelSpeculator):
 
     def load_model(self, target_model):
         self.model = self.load_draft_model(target_model, set()).eval()
-        if self.full_draft:
+        options = self.execution_options
+        self.model.configure_inference(
+            fused_projections=options.fused_projections,
+            rms_norm=self.create_rmsnorm_impl() if options.fused_rmsnorm else None,
+        )
+        if options.optimized_executor:
+            self.execution = LEagleExecution(
+                self.model,
+                self.context,
+                self.max_num_tokens,
+                self.num_speculative_steps,
+                options,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        elif self.full_draft:
             self.graph_inputs = LEagleGraphInputs.allocate(
                 self.model,
                 self.max_model_len,
@@ -133,6 +157,11 @@ class LEagleSpeculator(DraftModelSpeculator):
             return
         if not cudagraph_mode.has_full_cudagraphs():
             raise ValueError("Target backend disabled FULL graphs required by LEAGLE")
+        if getattr(self, "execution", None) is not None:
+            self.graph_runner = LEagleOptimizedGraphRunner(
+                self.execution, self.create_graph_backend()
+            )
+            return
         if self.graph_inputs is None:
             raise RuntimeError("LEAGLE graph inputs must be allocated before profiling")
         self.graph_runner = LEagleGraphRunner(
@@ -146,6 +175,18 @@ class LEagleSpeculator(DraftModelSpeculator):
         if self.device.type != "cuda":
             raise ValueError("Use the Ascend LEAGLE speculator for NPU graph capture")
         return NativeLEagleGraphBackend(torch.cuda, self.device, torch.cuda.CUDAGraph)
+
+    def create_rmsnorm_impl(self):
+        # Worker-only import keeps the CPU reference model independent of CUDA.
+        from vllm import _custom_ops
+
+        def rms_norm(hidden, weight, epsilon):
+            flattened = hidden.reshape(-1, hidden.shape[-1]).contiguous()
+            output = torch.empty_like(flattened)
+            _custom_ops.rms_norm(output, flattened, weight, epsilon)
+            return output.view_as(hidden)
+
+        return rms_norm
 
     def capture(self):
         if self.graph_runner is not None:
@@ -179,9 +220,12 @@ class LEagleSpeculator(DraftModelSpeculator):
         )
         self.draft_tokens.fill_(-1)
         result = self.draft_tokens[: input_batch.num_reqs]
+        execution = getattr(self, "execution", None)
         if dummy_run:
             if (not skip_attn_for_dummy_run or is_profile) and count:
-                if getattr(self, "full_draft", False):
+                if execution is not None:
+                    execution.profile()
+                elif getattr(self, "full_draft", False):
                     # Include both persistent inputs and graph-shaped operator
                     # workspace before the framework budgets target KV memory.
                     projected = self.model.project_context(self.graph_inputs.features)
@@ -209,7 +253,15 @@ class LEagleSpeculator(DraftModelSpeculator):
             [aux_hidden_states[capture_order.index(layer)] for layer in layers], dim=-1
         )
         full_draft = getattr(self, "full_draft", False)
-        if full_draft:
+        if execution is not None:
+            if full_draft and self.graph_runner is None:
+                raise RuntimeError("Optimized LEAGLE graph manager is not initialized")
+            projected = execution.project(
+                features,
+                input_batch.positions,
+                self.graph_runner if full_draft else None,
+            )
+        elif full_draft:
             if self.graph_runner is None:
                 raise RuntimeError("LEAGLE FULL graph manager is not initialized")
             projected = self.graph_runner.project_context(features)
@@ -219,6 +271,7 @@ class LEagleSpeculator(DraftModelSpeculator):
         rejected = num_rejected.cpu().tolist()
         sampled = num_sampled.cpu().tolist()
         positions = input_batch.positions.cpu().tolist()
+        active = []
         for row, req_id in enumerate(input_batch.req_ids):
             begin, end = map(int, input_batch.query_start_loc_np[row : row + 2])
             end -= rejected[row]
@@ -228,8 +281,15 @@ class LEagleSpeculator(DraftModelSpeculator):
             if positions[begin:end] != list(range(start, start + end - begin)):
                 raise ValueError("LEAGLE requires contiguous target positions")
             slot = int(input_batch.idx_mapping_np[row])
-            context = self.context.update(slot, req_id, start, projected[begin:end])
+            context = (
+                execution.update(slot, req_id, start, begin, end)
+                if execution is not None
+                else self.context.update(slot, req_id, start, projected[begin:end])
+            )
             if sampled[row] and count:
+                if execution is not None:
+                    active.append((row, slot))
+                    continue
                 anchor = last_sampled[slot : slot + 1, :1]
                 tokens = (
                     self.graph_runner.propose(context, anchor, count)
@@ -237,4 +297,12 @@ class LEagleSpeculator(DraftModelSpeculator):
                     else self.model.propose_context(context, anchor, count)
                 )
                 result[row, :count].copy_(tokens[0])
+        if execution is not None:
+            return execution.propose(
+                active,
+                last_sampled,
+                result,
+                count,
+                self.graph_runner if full_draft else None,
+            )
         return result

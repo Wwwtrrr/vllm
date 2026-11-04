@@ -615,6 +615,17 @@ class SpeculativeConfig:
     """For Qwen3 DSpark drafting, evaluate the Markov projection only for the
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
+    leagle_reuse_context_kv: bool = True
+    """Reuse target-conditioned LEAGLE prefix KV across proposal rounds."""
+    leagle_static_draft_kv: bool = True
+    """Use fixed inference buffers instead of repeatedly concatenating draft KV."""
+    leagle_batch_drafts: bool = True
+    """Batch LEAGLE requests, including padded FULL graph replay."""
+    leagle_fused_projections: bool = True
+    """Pack QKV/KV and gate/up projections without changing checkpoint names."""
+    leagle_fused_rmsnorm: bool = True
+    """Use the serving device's fused RMSNorm for LEAGLE."""
+
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
@@ -637,6 +648,16 @@ class SpeculativeConfig:
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
+        if self.method == "leagle":
+            factors.append(
+                (
+                    self.leagle_reuse_context_kv,
+                    self.leagle_static_draft_kv,
+                    self.leagle_batch_drafts,
+                    self.leagle_fused_projections,
+                    self.leagle_fused_rmsnorm,
+                )
+            )
         if self.method == "dspark":
             factors.append(self.enable_adaptive_verification)
 
