@@ -91,6 +91,33 @@ before using its latency as a serving benchmark.
 
 ## Inference optimizations
 
+### Trained candidate head
+
+Checkpoints with `candidate_head=true` now use the trained
+`candidate_head.down_proj.weight` and `candidate_head.up_proj.weight` for low-rank
+retrieval. Each step computes coarse scores, selects the checkpoint's
+`candidate_head_top_k`, gathers only those LM-head rows and scores the candidates
+at full hidden width. Greedy selection reduces the candidate scores directly;
+it does not materialize full-vocabulary logits. `compute_logits` remains
+available and scatters candidate scores into a vocabulary tensor with `-inf`
+elsewhere, matching the training implementation. Ties select the smallest draft
+vocabulary ID before applying the existing draft-to-target mapping.
+
+The checkpoint architecture is the default. Optional `speculative_config`
+overrides are `leagle_use_candidate_head=false` for dense A/B evaluation, and
+`leagle_candidate_top_k` for an enabled candidate head. Overrides are applied
+before graph capture; changing retrieval at replay time is unsupported.
+Missing, mismatched or non-finite candidate weights are rejected. Dense
+checkpoints cannot enable this path without trained candidate weights, and
+remain unchanged by default. No random candidate head is added to old models.
+
+Candidate retrieval is shared by eager and FULL, including batched cached
+rollouts. It changes the proposal support and may reduce acceptance; evaluate
+recall, acceptance and end-to-end TPOT rather than assuming a speedup. Greedy
+draft proposals still use the existing one-hot rejection-sampling path.
+CPU parity tests cover the actual training candidate implementation; native
+NPU Top-K, gather, small matmul and graph replay require hardware validation.
+
 The following `speculative_config` switches default to `true` for LEAGLE:
 
 | Option | Behavior |

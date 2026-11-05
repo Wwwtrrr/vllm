@@ -473,10 +473,16 @@ def test_packed_projections_preserve_logits_and_checkpoint_names(dtype):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("candidate", [False, True])
 def test_optimized_serving_matches_reference_across_requests_and_rounds(
-    runtime, full, reuse, static, batch, dtype
+    runtime, full, reuse, static, batch, dtype, candidate
 ):
-    reference = make_model(architecture(2, 2, window=4)).to(dtype=dtype)
+    config = architecture(2, 2, window=4)
+    if candidate:
+        config.update(
+            candidate_head=True, candidate_head_rank=4, candidate_head_top_k=3
+        )
+    reference = make_model(config).to(dtype=dtype)
     model = copy.deepcopy(reference)
     model.configure_inference(fused_projections=True)
     context = context_module.LEagleContext(3, 16, 16, dtype=dtype, device="cpu")
@@ -766,8 +772,9 @@ def test_full_draft_workspace_is_profiled_without_target_kv(runtime):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("candidate", [False, True])
 def test_logits_match_real_training_code(
-    layers, loops, norm, window, reduced, dtype, monkeypatch
+    layers, loops, norm, window, reduced, dtype, candidate, monkeypatch
 ):
     training_root = os.environ.get("LEAGLE_TRAINING_ROOT")
     if not training_root:
@@ -794,6 +801,10 @@ def test_logits_match_real_training_code(
 
     reload_schemas()
     config = architecture(layers, loops, reduced, norm, window)
+    if candidate:
+        config.update(
+            candidate_head=True, candidate_head_rank=4, candidate_head_top_k=3
+        )
     decoder = Qwen3Config(**config["transformer_layer_config"])
     decoder._attn_implementation = "sdpa"
     training = LEagleDraftModel(
@@ -827,11 +838,14 @@ def test_logits_match_real_training_code(
     features, anchor = torch.randn(1, 9, 32, dtype=dtype), torch.tensor([[5]])
     expected, logits = training.propose(features, anchor, num_tokens=7)
     actual_logits = []
-    handle = inference.lm_head.register_forward_hook(
-        lambda _module, _args, output: actual_logits.append(output)
-    )
+    original_select = inference.select_greedy_token
+
+    def record_selection(hidden):
+        actual_logits.append(inference.compute_logits(hidden))
+        return original_select(hidden)
+
+    inference.select_greedy_token = record_selection
     actual = inference.propose_context(inference.project_context(features), anchor, 7)
-    handle.remove()
     torch.testing.assert_close(actual, expected)
     tolerance = {"atol": 2e-6, "rtol": 2e-5} if dtype == torch.float32 else {}
     torch.testing.assert_close(torch.cat(actual_logits, 1), logits, **tolerance)
@@ -839,10 +853,69 @@ def test_logits_match_real_training_code(
     actual_logits.clear()
     padded = torch.randn(1, 16, 16, dtype=dtype) * 100
     padded[:, :9] = inference.project_context(features)
-    handle = inference.lm_head.register_forward_hook(
-        lambda _module, _args, output: actual_logits.append(output)
-    )
     actual = inference.propose_static(padded, torch.tensor([9]), anchor, 7)
-    handle.remove()
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(torch.cat(actual_logits, 1), logits, **tolerance)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("reduced", [False, True])
+@torch.inference_mode()
+def test_candidate_selection_loader_ties_and_dense_override(dtype, reduced):
+    config = architecture(1, 2, reduced=reduced)
+    config.update(candidate_head=True, candidate_head_rank=4, candidate_head_top_k=3)
+    converted = copy.deepcopy(config["transformer_layer_config"])
+    algos.update_leagle(config, converted)
+    assert converted["leagle_config"]["candidate_head"] is True
+    model = make_model(converted["leagle_config"]).to(dtype)
+    checkpoint = {name: value.clone() for name, value in model.state_dict().items()}
+    if reduced:
+        checkpoint["d2t"] = torch.arange(12)
+    model.load_weights(checkpoint.items())
+    hidden = torch.randn(2, 1, 16, dtype=dtype)
+    expected = model.compute_logits(hidden).argmax(-1)
+    # Candidate inference must never execute the full dense LM-head module.
+    with patch.object(
+        model.lm_head, "forward", side_effect=AssertionError("dense head called")
+    ):
+        torch.testing.assert_close(model.select_greedy_token(hidden), expected)
+        # Exact scores tied at zero: unsorted candidate order must not affect ID.
+        model.lm_head.weight.zero_()
+        torch.testing.assert_close(
+            model.select_greedy_token(hidden), model.compute_logits(hidden).argmax(-1)
+        )
+    broken = dict(checkpoint)
+    del broken["candidate_head.down_proj.weight"]
+    with pytest.raises(ValueError, match="Missing LEAGLE"):
+        model.load_weights(broken.items())
+    broken = dict(checkpoint)
+    broken["candidate_head.up_proj.weight"] = torch.full_like(
+        broken["candidate_head.up_proj.weight"], float("nan")
+    )
+    with pytest.raises(ValueError, match="finite"):
+        model.load_weights(broken.items())
+    model.load_weights(checkpoint.items())
+    model.configure_candidate_head(enabled=False)
+    torch.testing.assert_close(model.compute_logits(hidden), model.lm_head(hidden))
+    dense = make_model(architecture())
+    with pytest.raises(ValueError, match="no trained candidate"):
+        dense.configure_candidate_head(enabled=True)
+    with pytest.raises(ValueError, match="requires an enabled"):
+        dense.configure_candidate_head(top_k=3)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("candidate_head_rank", 0),
+        ("candidate_head_rank", 17),
+        ("candidate_head_top_k", 0),
+        ("candidate_head_top_k", 25),
+    ],
+)
+def test_invalid_candidate_geometry_rejected(key, value):
+    config = architecture()
+    config.update(candidate_head=True, candidate_head_rank=4, candidate_head_top_k=3)
+    config[key] = value
+    with pytest.raises(ValueError, match="candidate"):
+        make_model(config)

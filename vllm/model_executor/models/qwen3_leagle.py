@@ -42,6 +42,18 @@ class LEagleRMSNorm(Qwen3RMSNorm):
         return self.implementation(hidden_states, self.weight, self.variance_epsilon)
 
 
+class LEagleCandidateHead(nn.Module):
+    """Keep the trained low-rank retrieval parameter names unchanged."""
+
+    def __init__(self, width, vocab, rank):
+        super().__init__()
+        self.down_proj = nn.Linear(width, rank, bias=False)
+        self.up_proj = nn.Linear(rank, vocab, bias=False)
+
+    def forward(self, hidden):
+        return self.up_proj(self.down_proj(hidden))
+
+
 class LEagleStaticKV:
     def __init__(self, draft, attention):
         self.draft, self.attention = draft, attention
@@ -250,6 +262,22 @@ class LEagleDraftModel(nn.Module):
             decoder.vocab_size, width, padding_idx=decoder.pad_token_id
         )
         self.lm_head = nn.Linear(width, self.draft_vocab_size, bias=False)
+        candidate = config.get("candidate_head", False)
+        if type(candidate) is not bool:
+            raise ValueError("LEAGLE candidate_head must be a boolean")
+        self.candidate_head = None
+        self.candidate_head_enabled = candidate
+        self.candidate_top_k = config.get("candidate_head_top_k", 128)
+        if candidate:
+            rank = config.get("candidate_head_rank", 256)
+            if type(rank) is not int or not 1 <= rank <= min(
+                width, self.draft_vocab_size
+            ):
+                raise ValueError("LEAGLE candidate rank exceeds hidden/vocabulary size")
+            self.candidate_head = LEagleCandidateHead(
+                width, self.draft_vocab_size, rank
+            )
+            self.configure_candidate_head()
         self.fc = nn.Linear(len(self.target_layer_ids) * width, width, bias=False)
         self.hidden_norm = LEagleRMSNorm(width, eps=eps)
         self.embed_norm = LEagleRMSNorm(width, eps=eps)
@@ -274,7 +302,50 @@ class LEagleDraftModel(nn.Module):
         return self.embed_tokens(input_ids)
 
     def compute_logits(self, hidden_states):
+        if self.candidate_head_enabled:
+            candidates, scores = self._candidate_scores(hidden_states)
+            logits = hidden_states.new_full(
+                (*hidden_states.shape[:-1], self.draft_vocab_size), -torch.inf
+            )
+            return logits.scatter_(-1, candidates, scores)
         return self.lm_head(hidden_states)
+
+    def configure_candidate_head(self, enabled=None, top_k=None):
+        if enabled is not None:
+            if enabled and self.candidate_head is None:
+                raise ValueError("LEAGLE checkpoint has no trained candidate head")
+            self.candidate_head_enabled = enabled
+        if top_k is not None:
+            if not self.candidate_head_enabled:
+                raise ValueError(
+                    "LEAGLE candidate top_k requires an enabled candidate head"
+                )
+            self.candidate_top_k = top_k
+        if self.candidate_head_enabled and (
+            type(self.candidate_top_k) is not int
+            or not 1 <= self.candidate_top_k <= self.draft_vocab_size
+        ):
+            raise ValueError("LEAGLE candidate top_k must be in [1, draft_vocab_size]")
+
+    def _candidate_scores(self, hidden_states):
+        candidates = (
+            self.candidate_head(hidden_states)
+            .topk(self.candidate_top_k, dim=-1, sorted=False)
+            .indices
+        )
+        rows = F.embedding(candidates, self.lm_head.weight)
+        scores = torch.matmul(rows, hidden_states.unsqueeze(-1)).squeeze(-1)
+        return candidates, scores
+
+    def select_greedy_token(self, hidden_states):
+        if not self.candidate_head_enabled:
+            return self.compute_logits(hidden_states).argmax(-1)
+        candidates, scores = self._candidate_scores(hidden_states)
+        maximum = scores.max(dim=-1, keepdim=True).values
+        winners = (scores == maximum) | (torch.isnan(scores) & torch.isnan(maximum))
+        # Match argmax of dense scattered logits, including unsorted Top-K ties.
+        token = torch.where(winners, candidates, self.draft_vocab_size).min(-1).values
+        return torch.where(torch.isneginf(maximum.squeeze(-1)), 0, token)
 
     def forward(
         self,
@@ -438,7 +509,7 @@ class LEagleDraftModel(nn.Module):
                 static_kv=workspace,
                 draft_step=step,
             )
-            token = self.compute_logits(output.hidden_states).argmax(-1)
+            token = self.select_greedy_token(output.hidden_states)
             if self.use_draft_vocab:
                 token = token + self.d2t[token]
             state, caches = output.recurrent_state, output.past_draft_kv
@@ -507,7 +578,7 @@ class LEagleDraftModel(nn.Module):
                 attention_masks=masks,
                 past_draft_kv=caches,
             )
-            token = self.compute_logits(output.hidden_states).argmax(-1)
+            token = self.select_greedy_token(output.hidden_states)
             if self.use_draft_vocab:
                 token = token + self.d2t[token]
             state, caches = output.recurrent_state, output.past_draft_kv
@@ -554,7 +625,7 @@ class LEagleDraftModel(nn.Module):
                 attention_masks=masks,
                 past_draft_kv=caches,
             )
-            token = self.compute_logits(output.hidden_states).argmax(-1)
+            token = self.select_greedy_token(output.hidden_states)
             if self.use_draft_vocab:
                 token = token + self.d2t[token]
             state, caches = output.recurrent_state, output.past_draft_kv
@@ -583,6 +654,10 @@ class LEagleDraftModel(nn.Module):
         missing = tensors.keys() - loaded
         if missing:
             raise ValueError(f"Missing LEAGLE checkpoint tensors: {sorted(missing)}")
+        if self.candidate_head is not None:
+            for parameter in self.candidate_head.parameters():
+                if not torch.isfinite(parameter).all():
+                    raise ValueError("LEAGLE candidate head weights must be finite")
         if self.d2t is not None:
             ids = torch.arange(self.draft_vocab_size, device=self.d2t.device) + self.d2t
             if (

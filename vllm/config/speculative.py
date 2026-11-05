@@ -625,6 +625,10 @@ class SpeculativeConfig:
     """Pack QKV/KV and gate/up projections without changing checkpoint names."""
     leagle_fused_rmsnorm: bool = True
     """Use the serving device's fused RMSNorm for LEAGLE."""
+    leagle_use_candidate_head: bool | None = None
+    """Use checkpoint candidate-head setting by default; false selects dense A/B."""
+    leagle_candidate_top_k: int | None = Field(default=None, ge=1)
+    """Override retrieval width for a trained LEAGLE candidate head."""
 
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
@@ -656,6 +660,8 @@ class SpeculativeConfig:
                     self.leagle_batch_drafts,
                     self.leagle_fused_projections,
                     self.leagle_fused_rmsnorm,
+                    self.leagle_use_candidate_head,
+                    self.leagle_candidate_top_k,
                 )
             )
         if self.method == "dspark":
@@ -663,6 +669,20 @@ class SpeculativeConfig:
 
         if self.draft_model_config is not None:
             factors.append(self.draft_model_config.compute_hash())
+            if self.method == "leagle":
+                architecture = getattr(
+                    self.draft_model_config.hf_config, "leagle_config", {}
+                )
+                factors.append(
+                    tuple(
+                        architecture.get(key)
+                        for key in (
+                            "candidate_head",
+                            "candidate_head_rank",
+                            "candidate_head_top_k",
+                        )
+                    )
+                )
             # The specific layers used also affect the computation graph.
             layer_ids = getattr(
                 self.draft_model_config.hf_config,
