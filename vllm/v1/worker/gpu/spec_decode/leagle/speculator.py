@@ -112,9 +112,13 @@ class LEagleSpeculator(DraftModelSpeculator):
 
     def load_model(self, target_model):
         self.model = self.load_draft_model(target_model, set()).eval()
-        self.model.configure_candidate_head(
+        self.model.configure_output_head(
+            svd_rank=getattr(
+                self.speculative_config, "leagle_candidate_svd_rank", None
+            ),
             enabled=getattr(self.speculative_config, "leagle_use_candidate_head", None),
             top_k=getattr(self.speculative_config, "leagle_candidate_top_k", None),
+            rerank=getattr(self.speculative_config, "leagle_candidate_rerank", None),
         )
         options = self.execution_options
         self.model.configure_inference(

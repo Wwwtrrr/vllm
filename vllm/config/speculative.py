@@ -629,6 +629,10 @@ class SpeculativeConfig:
     """Use checkpoint candidate-head setting by default; false selects dense A/B."""
     leagle_candidate_top_k: int | None = Field(default=None, ge=1)
     """Override retrieval width for a trained LEAGLE candidate head."""
+    leagle_candidate_svd_rank: int | None = Field(default=None, ge=1)
+    """Derive inference-only SVD factors from loaded dense LM head before capture."""
+    leagle_candidate_rerank: bool | None = None
+    """True rescores candidates; false uses low-rank full-vocabulary logits."""
 
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
@@ -662,6 +666,8 @@ class SpeculativeConfig:
                     self.leagle_fused_rmsnorm,
                     self.leagle_use_candidate_head,
                     self.leagle_candidate_top_k,
+                    self.leagle_candidate_svd_rank,
+                    self.leagle_candidate_rerank,
                 )
             )
         if self.method == "dspark":
@@ -680,6 +686,7 @@ class SpeculativeConfig:
                             "candidate_head",
                             "candidate_head_rank",
                             "candidate_head_top_k",
+                            "candidate_rerank",
                         )
                     )
                 )

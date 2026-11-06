@@ -91,6 +91,50 @@ before using its latency as a serving benchmark.
 
 ## Inference optimizations
 
+### Inference-only SVD head
+
+Dense LEAGLE checkpoints can derive an SVD retrieval head at startup, without
+candidate training, checkpoint conversion or random initialization:
+
+```python
+speculative_config = {
+    "method": "leagle",
+    "model": "/path/to/existing/leagle/checkpoint",
+    "num_speculative_tokens": 7,
+    "draft_sample_method": "greedy",
+    "leagle_candidate_svd_rank": 256,
+    "leagle_candidate_top_k": 256,
+}
+```
+
+After all dense weights load, CPU FP64 vocabulary chunks accumulate `W.T @ W`;
+`eigh` extracts leading right singular vectors `Q`. The inference buffers are
+`up_weight = W @ Q` and `down_weight = Q.T`, matching `looped_eagle`'s SVD
+implementation. They are nonpersistent, retain the LM head dtype/device and
+are built before memory profiling and FULL capture. No SVD enters a replay.
+The full original LM head stays available for exact candidate scoring.
+
+Default SVD scoring is low-rank Top-K retrieval followed by exact rescoring.
+Set `leagle_candidate_rerank=false` and omit `leagle_candidate_top_k` to predict
+directly from low-rank full-vocabulary logits instead. This second mode skips
+both Top-K and exact rescoring and can change predictions more substantially.
+Checkpoint `candidate_rerank` is also preserved for trained low-rank heads;
+an explicit SVD rank defaults to reranking regardless of checkpoint mode.
+
+Rank must not exceed the smaller weight dimension. SVD rank cannot be combined
+with `leagle_use_candidate_head=false`. For dense A/B runs, remove the SVD rank
+and set `leagle_use_candidate_head=false`; restart the engine for each variant.
+Changing rank/scoring or hot-reloading dense weights after SVD setup requires
+restart and recapture, preventing stale factors or captured pointers.
+
+Large weights can make FP64 CPU initialization take substantial time. Logs
+report initialization start/end; factors are rebuilt on each startup and are
+not saved to the checkpoint or a disk cache. Account for CPU workspaces and
+additional device factor memory: this does not reduce resident dense weights.
+Repeated eigenvalues may yield different bases across environments. Evaluate
+real hidden-state recall, acceptance, output quality and TPOT on the NPU; the
+factorization alone guarantees neither identical tokens nor a speedup.
+
 ### Trained candidate head
 
 Checkpoints with `candidate_head=true` now use the trained

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """LEAGLE inference matching speculators.models.leagle checkpoints."""
 
+import logging
+import time
 from collections.abc import Iterable
 from typing import NamedTuple
 
@@ -52,6 +54,55 @@ class LEagleCandidateHead(nn.Module):
 
     def forward(self, hidden):
         return self.up_proj(self.down_proj(hidden))
+
+
+class LEagleSVDHead(nn.Module):
+    """Inference-only WQ/Q.T factors; match looped_eagle's CPU FP64 Gram method."""
+
+    @torch.no_grad()
+    def __init__(self, weight, rank):
+        super().__init__()
+        if weight.is_meta or weight.ndim != 2 or not weight.is_floating_point():
+            raise ValueError("SVD requires a loaded floating-point LM head")
+        if type(rank) is not int or not 1 <= rank <= min(weight.shape):
+            raise ValueError("SVD rank exceeds hidden/vocabulary size")
+        started = time.perf_counter()
+        logging.getLogger(__name__).info(
+            "Building LEAGLE SVD head on CPU (FP64 Gram/eigh), rank=%d; "
+            "initialization may take time for large vocabularies",
+            rank,
+        )
+        vocab, width = weight.shape
+        chunk = 2048
+        gram = torch.zeros(width, width, dtype=torch.float64, device="cpu")
+        for start in range(0, vocab, chunk):
+            rows = weight[start : start + chunk].detach().to("cpu", torch.float64)
+            if not torch.isfinite(rows).all():
+                raise ValueError("SVD requires finite LM head weights")
+            gram.addmm_(rows.T, rows)
+        if not torch.isfinite(gram).all():
+            raise ValueError("SVD Gram matrix overflowed")
+        _, vectors = torch.linalg.eigh(gram)
+        basis = vectors[:, -rank:].flip(-1).contiguous()
+        del gram, vectors, rows
+        up = torch.empty(vocab, rank, dtype=weight.dtype, device="cpu")
+        for start in range(0, vocab, chunk):
+            rows = weight[start : start + chunk].detach().to("cpu", torch.float64)
+            up[start : start + rows.shape[0]].copy_(rows @ basis)
+        self.register_buffer("up_weight", up.to(weight.device), persistent=False)
+        self.register_buffer(
+            "down_weight",
+            basis.T.to(device=weight.device, dtype=weight.dtype),
+            persistent=False,
+        )
+        if not all(torch.isfinite(t).all() for t in (self.up_weight, self.down_weight)):
+            raise ValueError("SVD factors are non-finite after dtype conversion")
+        logging.getLogger(__name__).info(
+            "LEAGLE SVD head initialized in %.2f seconds", time.perf_counter() - started
+        )
+
+    def forward(self, hidden):
+        return F.linear(F.linear(hidden, self.down_weight), self.up_weight)
 
 
 class LEagleStaticKV:
@@ -266,7 +317,11 @@ class LEagleDraftModel(nn.Module):
         if type(candidate) is not bool:
             raise ValueError("LEAGLE candidate_head must be a boolean")
         self.candidate_head = None
+        self.svd_candidate_head = None
         self.candidate_head_enabled = candidate
+        self.candidate_rerank = config.get("candidate_rerank", True)
+        if type(self.candidate_rerank) is not bool:
+            raise ValueError("LEAGLE candidate_rerank must be a boolean")
         self.candidate_top_k = config.get("candidate_head_top_k", 128)
         if candidate:
             rank = config.get("candidate_head_rank", 256)
@@ -303,6 +358,8 @@ class LEagleDraftModel(nn.Module):
 
     def compute_logits(self, hidden_states):
         if self.candidate_head_enabled:
+            if not self.candidate_rerank:
+                return self._coarse_logits(hidden_states)
             candidates, scores = self._candidate_scores(hidden_states)
             logits = hidden_states.new_full(
                 (*hidden_states.shape[:-1], self.draft_vocab_size), -torch.inf
@@ -310,9 +367,41 @@ class LEagleDraftModel(nn.Module):
             return logits.scatter_(-1, candidates, scores)
         return self.lm_head(hidden_states)
 
-    def configure_candidate_head(self, enabled=None, top_k=None):
+    def configure_output_head(
+        self, *, svd_rank=None, enabled=None, top_k=None, rerank=None
+    ):
+        if svd_rank is not None:
+            if enabled is False:
+                raise ValueError("SVD rank cannot disable the candidate head")
+            if rerank is False and top_k is not None:
+                raise ValueError("Candidate top_k requires candidate reranking")
+            default_k = min(128, self.draft_vocab_size) if rerank is False else 128
+            self.set_svd_candidate_head(
+                svd_rank, top_k=default_k if top_k is None else top_k
+            )
+        self.configure_candidate_head(enabled, top_k, rerank)
+
+    def set_svd_candidate_head(self, rank, *, top_k=128):
+        if self.training:
+            raise ValueError("SVD head requires eval mode")
+        if type(top_k) is not int or not 1 <= top_k <= self.draft_vocab_size:
+            raise ValueError("LEAGLE candidate top_k must be in [1, draft_vocab_size]")
+        self.svd_candidate_head = LEagleSVDHead(self.lm_head.weight, rank).eval()
+        self.configure_candidate_head(enabled=True, top_k=top_k, rerank=True)
+
+    def configure_candidate_head(self, enabled=None, top_k=None, rerank=None):
+        selected_enabled = self.candidate_head_enabled if enabled is None else enabled
+        selected_rerank = self.candidate_rerank if rerank is None else rerank
+        if rerank is True and not selected_enabled:
+            raise ValueError("Candidate reranking requires an enabled candidate head")
+        if top_k is not None and selected_enabled and not selected_rerank:
+            raise ValueError("Candidate top_k requires candidate reranking")
         if enabled is not None:
-            if enabled and self.candidate_head is None:
+            if (
+                enabled
+                and self.candidate_head is None
+                and self.svd_candidate_head is None
+            ):
                 raise ValueError("LEAGLE checkpoint has no trained candidate head")
             self.candidate_head_enabled = enabled
         if top_k is not None:
@@ -321,15 +410,22 @@ class LEagleDraftModel(nn.Module):
                     "LEAGLE candidate top_k requires an enabled candidate head"
                 )
             self.candidate_top_k = top_k
+        self.candidate_rerank = selected_rerank
         if self.candidate_head_enabled and (
             type(self.candidate_top_k) is not int
             or not 1 <= self.candidate_top_k <= self.draft_vocab_size
         ):
             raise ValueError("LEAGLE candidate top_k must be in [1, draft_vocab_size]")
 
+    def _coarse_logits(self, hidden_states):
+        head = self.svd_candidate_head
+        if head is None:
+            head = self.candidate_head
+        return head(hidden_states)
+
     def _candidate_scores(self, hidden_states):
         candidates = (
-            self.candidate_head(hidden_states)
+            self._coarse_logits(hidden_states)
             .topk(self.candidate_top_k, dim=-1, sorted=False)
             .indices
         )
@@ -338,7 +434,7 @@ class LEagleDraftModel(nn.Module):
         return candidates, scores
 
     def select_greedy_token(self, hidden_states):
-        if not self.candidate_head_enabled:
+        if not self.candidate_head_enabled or not self.candidate_rerank:
             return self.compute_logits(hidden_states).argmax(-1)
         candidates, scores = self._candidate_scores(hidden_states)
         maximum = scores.max(dim=-1, keepdim=True).values
@@ -634,6 +730,10 @@ class LEagleDraftModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load exact training names and reject incomplete inference checkpoints."""
+        if self.svd_candidate_head is not None:
+            raise ValueError(
+                "Reloading an SVD head requires restart and graph recapture"
+            )
         tensors = dict(self.named_parameters())
         if self.d2t is not None:
             tensors["d2t"] = self.d2t

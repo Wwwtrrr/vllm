@@ -46,7 +46,12 @@ def update_leagle(config_dict: dict, pre_trained_config: dict) -> None:
             "draft_vocab_size": vocab,
         },
     )
-    for name in ("candidate_head", "candidate_head_rank", "candidate_head_top_k"):
+    for name in (
+        "candidate_head",
+        "candidate_head_rank",
+        "candidate_head_top_k",
+        "candidate_rerank",
+    ):
         if name in config_dict:
             pre_trained_config["leagle_config"][name] = config_dict[name]
 
