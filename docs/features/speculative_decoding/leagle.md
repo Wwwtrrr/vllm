@@ -78,13 +78,17 @@ projection input/output buffers, plus graph-pool memory. Request scheduling,
 verdict/position synchronization and staging copies remain outside graphs.
 For the optimized executor, projection outputs are copied into persistent
 feature/KV buffers inside the projection graph. A separate token-count-bucketed
-cache-update graph scatters each request's verified feature/KV suffix into its
-persistent slot. Padded writes use a private sink row and never touch live
-requests. Cache-update graphs run even for partial prefills without proposals.
+cache-update graph scatters the whole batch's verified feature/KV suffixes into
+their persistent slots. Host validation packs token destination/source indices
+once per batch; only accepted prefixes are included. Padded writes use distinct
+private sink addresses and never touch live requests. Cache-update graphs run
+even for partial prefills without proposals, and skip all-empty updates.
 The rollout graph gathers anchors by device slot indices. Slot/length metadata
 is uploaded together; host validation, request grouping and external input
-copies still remain outside capture. Each nonempty request suffix adds one
-cache-update replay; measure end-to-end latency rather than assuming a speedup.
+copies still remain outside capture. Each nonempty batch adds one cache-update
+replay, regardless of request count or the draft batching flag. Validation errors
+restore host context metadata before any device writes. K/V layout and generic
+IndexPut are unchanged; transpose costs still require hardware measurement.
 Requests are batched into batch-size and context-length buckets; each batch's
 K-token rollout is one FULL replay. Measure acceptance and output parity
 before using its latency as a serving benchmark.
@@ -190,7 +194,10 @@ and fused kernels can change floating-point rounding, so evaluate acceptance
 and output quality with the actual checkpoint as well as token parity tests.
 Additional memory includes packed weights, persistent K/V per physical layer,
 batched attention workspaces, draft KV per logical layer and graph buckets.
-Captured cache writes also reserve one private sink slot for features and K/V.
+Captured cache writes reserve `ceil(max_num_batched_tokens / max_model_len)`
+private sink rows for features and K/V, so a token-count bucket larger than one
+request's capacity still has distinct padding destinations. Update graph buckets
+cover the total batch token capacity, not just a single request's length.
 Increase `max_num_seqs` and `max_model_len` gradually while checking memory.
 This is dense cache execution, without paged attention or a fused attention
 kernel. Training-only chunked loss and DDP settings belong to the training

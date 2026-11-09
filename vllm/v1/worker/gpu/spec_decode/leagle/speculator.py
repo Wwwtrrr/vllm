@@ -280,6 +280,7 @@ class LEagleSpeculator(DraftModelSpeculator):
         sampled = num_sampled.cpu().tolist()
         positions = input_batch.positions.cpu().tolist()
         active = []
+        updates = []
         for row, req_id in enumerate(input_batch.req_ids):
             begin, end = map(int, input_batch.query_start_loc_np[row : row + 2])
             end -= rejected[row]
@@ -289,18 +290,10 @@ class LEagleSpeculator(DraftModelSpeculator):
             if positions[begin:end] != list(range(start, start + end - begin)):
                 raise ValueError("LEAGLE requires contiguous target positions")
             slot = int(input_batch.idx_mapping_np[row])
-            context = (
-                execution.update(
-                    slot,
-                    req_id,
-                    start,
-                    begin,
-                    end,
-                    self.graph_runner if full_draft else None,
-                )
-                if execution is not None
-                else self.context.update(slot, req_id, start, projected[begin:end])
-            )
+            if execution is not None:
+                updates.append((slot, req_id, start, begin, end))
+            else:
+                context = self.context.update(slot, req_id, start, projected[begin:end])
             if sampled[row] and count:
                 if execution is not None:
                     active.append((row, slot))
@@ -313,6 +306,7 @@ class LEagleSpeculator(DraftModelSpeculator):
                 )
                 result[row, :count].copy_(tokens[0])
         if execution is not None:
+            execution.update_batch(updates, self.graph_runner if full_draft else None)
             return execution.propose(
                 active,
                 last_sampled,

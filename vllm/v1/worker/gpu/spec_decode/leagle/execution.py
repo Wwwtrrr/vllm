@@ -50,12 +50,19 @@ class LEagleExecution:
         self.anchor = torch.zeros(requests, 1, dtype=torch.long, device=device)
         self.slots = self.batch_metadata[0]
         self.slots.zero_()
-        self.update_metadata = torch.zeros(4, dtype=torch.long, device=device)
-        # A private sink row gives every padded write a unique, harmless address.
-        self.context_storage = torch.cat(
-            (context.values, torch.zeros_like(context.values[:1])), dim=0
+        offsets = torch.arange(max_tokens, dtype=torch.long, device="cpu")
+        self.update_padding = torch.stack(
+            (requests + offsets // self.capacity, offsets % self.capacity, offsets),
+            dim=-1,
         )
-        context.values = self.context_storage[:-1]
+        self.update_metadata = self.update_padding.to(device=device, copy=True)
+        sink_rows = (max_tokens + self.capacity - 1) // self.capacity
+        # Private sink rows give every padded batch write a distinct address.
+        self.context_storage = torch.cat(
+            (context.values, context.values.new_zeros(sink_rows, self.capacity, width)),
+            dim=0,
+        )
+        context.values = self.context_storage[:requests]
 
         def allocate_kv(batch, capacity):
             return tuple(
@@ -76,13 +83,13 @@ class LEagleExecution:
         self.prefix_storage = tuple(
             tuple(tensor.transpose(1, 2) for tensor in pair)
             for pair in (
-                allocate_kv(requests + 1, self.capacity)
+                allocate_kv(requests + sink_rows, self.capacity)
                 if options.reuse_context_kv
                 else ()
             )
         )
         self.prefix_kv = tuple(
-            tuple(tensor[:-1].transpose(1, 2) for tensor in pair)
+            tuple(tensor[:requests].transpose(1, 2) for tensor in pair)
             for pair in self.prefix_storage
         )
         self.new_kv = allocate_kv(1, max_tokens) if options.reuse_context_kv else ()
@@ -98,7 +105,7 @@ class LEagleExecution:
         self.context_buckets = capture_buckets(self.capacity, minimum=128)
         self.batch_buckets = capture_buckets(self.batch_capacity)
         self.feature_buckets = capture_buckets(max_tokens)
-        self.update_buckets = capture_buckets(min(max_tokens, self.capacity))
+        self.update_buckets = capture_buckets(max_tokens)
 
     def projection_forward(self, size):
         projected = self.model.project_context(self.features[:size])
@@ -127,12 +134,7 @@ class LEagleExecution:
         return self.projected[:count]
 
     def update_forward(self, size):
-        slot, start, begin, length = self.update_metadata.unbind()
-        offsets = torch.arange(size, device=self.features.device)
-        valid = offsets < length
-        slots = torch.where(valid, slot, self.context.values.shape[0])
-        positions = torch.where(valid, start + offsets, offsets)
-        source = (begin + offsets).clamp(max=self.projected.shape[0] - 1)
+        slots, positions, source = self.update_metadata[:size].unbind(-1)
         self.context_storage.index_put_(
             (slots, positions), self.projected.index_select(0, source)
         )
@@ -145,18 +147,58 @@ class LEagleExecution:
 
     @torch.inference_mode()
     def update(self, slot, request_id, start, begin, end, graphs=None):
-        if not 0 <= begin < end <= self.projected.shape[0]:
-            raise ValueError("LEAGLE cache update exceeds projected token buffer")
-        length = end - begin
-        limit = self.context.advance(slot, request_id, start, length)
-        self.update_metadata.copy_(
-            torch.tensor([slot, start, begin, length], device=self.features.device)
-        )
-        if graphs is not None:
-            graphs.update(length)
+        self.update_batch([(slot, request_id, start, begin, end)], graphs)
+        return self.context.values[slot : slot + 1, : self.context.lengths[slot]]
+
+    def stage_updates(self, metadata, size):
+        if self.features.device.type == "cpu":
+            self.update_metadata[:size].copy_(metadata[:size])
         else:
-            self.update_forward(length)
-        return self.context.values[slot : slot + 1, :limit]
+            from vllm.utils.torch_utils import async_tensor_h2d
+
+            async_tensor_h2d(metadata[:size], out=self.update_metadata[:size])
+
+    @torch.inference_mode()
+    def update_batch(self, updates, graphs=None):
+        """Validate request suffixes, then scatter all valid tokens in one replay."""
+        if not updates:
+            return
+        if graphs is not None:
+            graphs._ready()
+        metadata = self.update_padding.clone()
+        ids, lengths = self.context.request_ids.copy(), self.context.lengths.copy()
+        seen, total = set(), 0
+        try:
+            for slot, request_id, start, begin, end in updates:
+                if not 0 <= slot < self.context.values.shape[0] or slot in seen:
+                    raise ValueError("LEAGLE cache batch requires distinct valid slots")
+                seen.add(slot)
+                if not 0 <= begin < end <= self.projected.shape[0]:
+                    raise ValueError(
+                        "LEAGLE cache update exceeds projected token buffer"
+                    )
+                length = end - begin
+                if total + length > self.projected.shape[0]:
+                    raise ValueError(
+                        "LEAGLE cache batch exceeds projected token buffer"
+                    )
+                self.context.advance(slot, request_id, start, length)
+                offsets = torch.arange(length, dtype=torch.long, device="cpu")
+                metadata[total : total + length, 0] = slot
+                metadata[total : total + length, 1] = start + offsets
+                metadata[total : total + length, 2] = begin + offsets
+                total += length
+        except Exception:
+            # Do not leave earlier requests advanced if a later suffix is invalid.
+            self.context.request_ids[:] = ids
+            self.context.lengths[:] = lengths
+            raise
+        size = LEagleOptimizedGraphRunner.bucket(self.update_buckets, total)
+        self.stage_updates(metadata, size)
+        if graphs is not None:
+            graphs.update(total)
+        else:
+            self.update_forward(total)
 
     def rollout_forward(self, batch, capacity):
         lengths = self.lengths[:batch]
@@ -265,7 +307,7 @@ class LEagleOptimizedGraphRunner(CudaGraphManager):
                 lambda size=size: state.projection_forward(size)
             )
         # Warmup/capture writes only the private sink, never live request rows.
-        state.update_metadata.zero_()
+        state.stage_updates(state.update_padding, state.update_padding.shape[0])
         for size in reversed(state.update_buckets):
             self.updates[size] = self.backend.capture(
                 lambda size=size: state.update_forward(size)

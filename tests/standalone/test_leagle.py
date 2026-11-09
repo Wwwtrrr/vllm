@@ -585,7 +585,7 @@ def test_optimized_serving_matches_reference_across_requests_and_rounds(
     run([(2, "a", 5, 2, 1, 1), (0, "b", 4, 3, 0, 1)])
     if full:
         assert proposer.graph_runner.proposal_replays == (4 if batch else 8)
-        assert proposer.graph_runner.update_replays == 9
+        assert proposer.graph_runner.update_replays == 4
     if reuse:
         # Exactly one projection of the new batch per round, never a projection
         # of complete request prefixes from inside the autoregressive rollout.
@@ -992,3 +992,85 @@ def test_svd_runtime_configuration_dense_fallback_and_checkpoint_unchanged():
     fresh.train()
     with pytest.raises(ValueError, match="eval"):
         fresh.set_svd_candidate_head(4, top_k=3)
+
+
+@pytest.mark.parametrize("full", [False, True])
+@torch.inference_mode()
+def test_sixteen_request_cache_update_is_one_replay_and_validation_is_atomic(full):
+    model = make_model(architecture(1, 1))
+    context = context_module.LEagleContext(16, 8, 16, dtype=torch.float32, device="cpu")
+    execution = execution_module.LEagleExecution(
+        model,
+        context,
+        64,
+        3,
+        execution_module.LEagleExecutionOptions(),
+        dtype=torch.float32,
+        device="cpu",
+    )
+    context.values.fill_(13)
+    for pair in execution.prefix_kv:
+        for tensor in pair:
+            tensor.fill_(17)
+    manager = None
+    if full:
+        manager = execution_module.LEagleOptimizedGraphRunner(
+            execution, TreeCPUReplayBackend()
+        )
+        manager.capture()
+    # 48 valid tokens round up to a 64-token graph, exceeding one request's
+    # 8-token capacity. Padding must use multiple distinct private sink rows.
+    features = torch.randn(64, 32)
+    execution.project(features, torch.arange(64) % 3, manager)
+    updates = [(slot, str(slot), 0, slot * 3, slot * 3 + 3) for slot in range(16)]
+    execution.update_batch(updates, manager)
+    if full:
+        assert manager.update_replays == 1
+        staged = execution.update_metadata[:64]
+        assert (staged[48:, 0] >= 16).all()
+        destinations = staged[:, 0] * 8 + staged[:, 1]
+        assert destinations.unique().numel() == 64
+    for slot in range(16):
+        source = slice(slot * 3, slot * 3 + 3)
+        torch.testing.assert_close(
+            context.values[slot, :3], execution.projected[source]
+        )
+        assert (context.values[slot, 3:] == 13).all()
+        for cached, new in zip(execution.prefix_kv, execution.new_kv):
+            for storage, values in zip(cached, new):
+                torch.testing.assert_close(
+                    storage[slot : slot + 1, :, :3], values[:, :, source]
+                )
+                assert (storage[slot, :, 3:] == 17).all()
+    snapshot = context.values.clone()
+    ids, lengths = context.request_ids.copy(), context.lengths.copy()
+    # A valid first request followed by a context gap must not partially
+    # advance host lengths or write device data for either request.
+    with pytest.raises(RuntimeError, match="missing target context"):
+        execution.update_batch([(0, "0", 3, 0, 1), (1, "1", 6, 1, 2)], manager)
+    with pytest.raises(ValueError, match="distinct"):
+        execution.update_batch([(0, "0", 3, 0, 1), (0, "0", 4, 1, 2)], manager)
+    assert context.lengths == lengths and context.request_ids == ids
+    torch.testing.assert_close(context.values, snapshot)
+    execution.update_batch([], manager)
+    if full:
+        assert manager.update_replays == 1
+    # Reorder slots, replace one request, and advance others in one batch.
+    updates = [
+        (
+            slot,
+            "replacement" if slot == 2 else str(slot),
+            0 if slot == 2 else 3,
+            15 - slot,
+            16 - slot,
+        )
+        for slot in reversed(range(16))
+    ]
+    execution.update_batch(updates, manager)
+    for slot, request_id, start, begin, end in updates:
+        torch.testing.assert_close(
+            context.values[slot, start : start + 1], execution.projected[begin:end]
+        )
+    assert context.lengths[2] == 1 and context.request_ids[2] == "replacement"
+    if full:
+        assert manager.update_replays == 2
