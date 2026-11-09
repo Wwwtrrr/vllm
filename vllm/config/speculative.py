@@ -633,8 +633,6 @@ class SpeculativeConfig:
     """Derive inference-only SVD factors from loaded dense LM head before capture."""
     leagle_candidate_rerank: bool | None = None
     """True rescores candidates; false uses low-rank full-vocabulary logits."""
-    leagle_target_input_graphs: bool = True
-    """On Ascend FULL decode, capture target token, position and KV-map preparation."""
 
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
@@ -670,7 +668,6 @@ class SpeculativeConfig:
                     self.leagle_candidate_top_k,
                     self.leagle_candidate_svd_rank,
                     self.leagle_candidate_rerank,
-                    self.leagle_target_input_graphs,
                 )
             )
         if self.method == "dspark":

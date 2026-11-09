@@ -91,15 +91,6 @@ before using its latency as a serving benchmark.
 
 ## Inference optimizations
 
-Ascend also supports target input preparation graphs via
-`leagle_target_input_graphs` (default `true` on eligible FULL decode steps).
-Request-map expansion, positions/lengths, verification token assembly, block
-table gathering and slot mappings run in a separate native preparation graph
-before target FULL replay. The shared block-table gather API accepts stable
-block-count buffers to avoid capturing rotating UVA pointers. CUDA preparation
-is unchanged. See the Ascend LEAGLE guide for eligibility, fallback and A/B
-evaluation; this does not capture CPU scheduling or eliminate all transfers.
-
 ### Inference-only SVD head
 
 Dense LEAGLE checkpoints can derive an SVD retrieval head at startup, without
