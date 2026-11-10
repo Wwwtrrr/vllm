@@ -385,6 +385,9 @@ class LEagleDraftModel(nn.Module):
         ):
             raise ValueError("LEAGLE quantized head geometry mismatch")
         self.quantized_lm_head = head
+        # Quantization is complete before profiling/capture. No dense fallback
+        # or candidate reranking is allowed after installing this head.
+        self.lm_head = None
 
     def configure_output_head(
         self, *, svd_rank=None, enabled=None, top_k=None, rerank=None

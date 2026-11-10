@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import os
 import sys
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -366,7 +367,9 @@ def runtime_config():
         ("use_v2_model_runner", False, "Runner V2"),
         ("model_config.enforce_eager", False, "FULL"),
         ("cache_config.enable_prefix_caching", True, "prefix-caching"),
-        ("parallel_config.tensor_parallel_size", 2, "TP=PP"),
+        ("parallel_config.pipeline_parallel_size", 2, "PP=DCP"),
+        ("parallel_config.decode_context_parallel_size", 2, "PP=DCP"),
+        ("parallel_config.prefill_context_parallel_size", 2, "PP=DCP"),
         (
             "speculative_config.draft_parallel_config.tensor_parallel_size",
             2,
@@ -393,16 +396,46 @@ def test_unsupported_runtime_fails_explicitly(runtime, path, value, message):
         runtime.validate_leagle_runtime(config)
 
 
-def test_full_target_and_draft_configuration_is_accepted(runtime):
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_full_target_and_draft_configuration_is_accepted(runtime, tp):
     config = runtime_config()
+    config.parallel_config.tensor_parallel_size = tp
     config.model_config.enforce_eager = False
     config.compilation_config = SimpleNamespace(
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True)
     )
     runtime.validate_leagle_runtime(config)
+    config.compilation_config.pass_config = SimpleNamespace(enable_sp=True)
+    with pytest.raises(ValueError, match="sequence parallel"):
+        runtime.validate_leagle_runtime(config)
+    config.compilation_config.pass_config.enable_sp = False
     config.compilation_config.cudagraph_mode.has_full_cudagraphs = lambda: False
     with pytest.raises(ValueError, match="FULL"):
         runtime.validate_leagle_runtime(config)
+
+
+def test_tp_proposals_use_rank_zero_without_changing_single_card(runtime, monkeypatch):
+    proposer = runtime.LEagleSpeculator.__new__(runtime.LEagleSpeculator)
+    calls = []
+    authoritative = torch.tensor([[3, 5, -1], [7, 9, 2]])
+
+    def broadcast(result, src):
+        calls.append(src)
+        result.copy_(authoritative)
+
+    distributed = ModuleType("vllm.distributed")
+    distributed.get_tp_group = lambda: SimpleNamespace(broadcast=broadcast)
+    monkeypatch.setitem(sys.modules, distributed.__name__, distributed)
+    result = torch.full_like(authoritative, -1)
+    proposer.target_tp_size = 1
+    assert proposer.synchronize_proposals(result) is result
+    assert not calls
+    proposer.target_tp_size = 2
+    assert proposer.synchronize_proposals(result) is result
+    assert calls == [0]
+    torch.testing.assert_close(result, authoritative)
+    proposer.synchronize_proposals(result[:0])
+    assert calls == [0]
 
 
 class CPUReplayBackend:
@@ -1080,6 +1113,7 @@ def test_sixteen_request_cache_update_is_one_replay_and_validation_is_atomic(ful
 def test_private_quantized_head_dispatch_and_restart_guards():
     model = make_model(architecture(1, 1))
     checkpoint = {key: value.clone() for key, value in model.state_dict().items()}
+    dense_weight = weakref.ref(model.lm_head.weight)
 
     class PrivateHead(torch.nn.Module):
         hidden_size, vocab_size = 16, 24
@@ -1091,14 +1125,14 @@ def test_private_quantized_head_dispatch_and_restart_guards():
             return output
 
     model.set_quantized_lm_head(PrivateHead())
+    assert model.lm_head is None
+    assert dense_weight() is None
+    assert "lm_head.weight" not in dict(model.named_parameters())
     with pytest.raises(ValueError, match="restart"):
         model.set_quantized_lm_head(PrivateHead())
     hidden = torch.randn(2, 1, 16)
-    with patch.object(
-        model.lm_head, "forward", side_effect=AssertionError("dense head called")
-    ):
-        assert (model.select_greedy_token(hidden) == 7).all()
-    assert checkpoint.keys() == model.state_dict().keys()
+    assert (model.select_greedy_token(hidden) == 7).all()
+    assert set(checkpoint) - set(model.state_dict()) == {"lm_head.weight"}
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, checkpoint[name])
     with pytest.raises(ValueError, match="restart"):

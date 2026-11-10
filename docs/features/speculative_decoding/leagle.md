@@ -43,11 +43,21 @@ language model or enable generic EAGLE3 paged attention. Checkpoint tensor names
 and FULL graph boundaries are unchanged by the single-step interface.
 
 The implementation uses Model Runner V2, PyTorch SDPA, a Qwen3 target,
-TP=PP=DCP=PCP=1, and greedy draft proposals. Target sampling still uses
+target tensor parallelism, PP=DCP=PCP=1, and greedy draft proposals. Target sampling still uses
 vLLM's normal verifier/rejection sampler; greedy draft probabilities are one-hot.
 Prefix caching, remote KV transfer, target LoRA, watermarking, quantized drafts,
 parallel drafting and adaptive verification are rejected. Paged draft attention
 is not implemented.
+
+For a two-device target, add `--tensor-parallel-size 2`. LEAGLE defaults
+`draft_tensor_parallel_size` to 1; explicitly setting a larger draft TP is rejected.
+Each target TP worker loads a complete draft and its context/KV buffers. Draft
+weights and cache memory are **replicated**, not sharded. This also applies to
+candidate/SVD and Ascend W8A8 heads. Proposals are broadcast from TP rank zero
+after each real rollout, outside the draft graph; profiling and capture do not
+perform this collective. Eager and FULL retain their existing graph boundaries.
+Sequence parallel target features are not supported. Multi-device hardware
+validation is required before relying on this path in production.
 
 For FULL target and draft graphs, remove `--enforce-eager` and add:
 
@@ -101,16 +111,19 @@ before using its latency as a serving benchmark.
 private online-quantized head. It retains every row of the draft vocabulary,
 uses per-output-channel symmetric INT8 weight scales and dynamically quantizes
 each hidden token to INT8. Native `npu_quant_matmul` returns BF16 logits for
-the existing greedy selector. The target model, original draft head and saved
-checkpoint are unchanged. This follows the private draft-head approach of
+the existing greedy selector. Once installed, the original BF16 draft head is
+released; the target model and saved checkpoint are unchanged. This follows the private draft-head approach of
 vLLM PR #59973, but uses Ascend INT8 operators rather than FP8/NVFP4 CUDA kernels
 and is scoped to this LEAGLE implementation, not generic EAGLE/MTP/DSpark.
 
 Default is `None` (original BF16). Only BF16 heads with hidden/vocabulary sizes
 divisible by 32 are supported initially. Weight quantization and optional NZ
 packing run during loading, before memory profiling and FULL capture. The
-private INT8 weight/scales are nonpersistent buffers and add resident memory;
-only inference weight traffic is reduced. They are rebuilt at startup, not
+private INT8 weight/scales are nonpersistent buffers and replace the resident
+BF16 draft head. For a 151936 x 2560 head, this saves about 742 MiB relative to
+keeping both heads, or about 371 MiB relative to BF16 alone, excluding scales
+and packing overhead. Startup peak memory still includes both representations.
+The allocator may retain freed memory for reuse. They are rebuilt at startup, not
 saved to disk. Weight reload/scoring changes require engine restart/recapture.
 Candidate/SVD scoring cannot be combined with this option; disable candidate
 scoring and remove SVD rank for a full-head quantization experiment. Whole-draft

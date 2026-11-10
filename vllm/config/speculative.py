@@ -1600,6 +1600,8 @@ class SpeculativeConfig:
                         self.num_speculative_tokens,
                     )
 
+                if self.method == "leagle" and self.draft_tensor_parallel_size is None:
+                    self.draft_tensor_parallel_size = 1
                 self.draft_tensor_parallel_size = (
                     SpeculativeConfig._verify_and_get_draft_tp(
                         self.target_parallel_config,
