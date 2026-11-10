@@ -366,9 +366,7 @@ def runtime_config():
         ("use_v2_model_runner", False, "Runner V2"),
         ("model_config.enforce_eager", False, "FULL"),
         ("cache_config.enable_prefix_caching", True, "prefix-caching"),
-        ("parallel_config.pipeline_parallel_size", 2, "PP=DCP"),
-        ("parallel_config.decode_context_parallel_size", 2, "PP=DCP"),
-        ("parallel_config.prefill_context_parallel_size", 2, "PP=DCP"),
+        ("parallel_config.tensor_parallel_size", 2, "TP=PP"),
         (
             "speculative_config.draft_parallel_config.tensor_parallel_size",
             2,
@@ -395,46 +393,16 @@ def test_unsupported_runtime_fails_explicitly(runtime, path, value, message):
         runtime.validate_leagle_runtime(config)
 
 
-@pytest.mark.parametrize("tp", [1, 2, 4])
-def test_full_target_and_draft_configuration_is_accepted(runtime, tp):
+def test_full_target_and_draft_configuration_is_accepted(runtime):
     config = runtime_config()
-    config.parallel_config.tensor_parallel_size = tp
     config.model_config.enforce_eager = False
     config.compilation_config = SimpleNamespace(
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True)
     )
     runtime.validate_leagle_runtime(config)
-    config.compilation_config.pass_config = SimpleNamespace(enable_sp=True)
-    with pytest.raises(ValueError, match="sequence parallel"):
-        runtime.validate_leagle_runtime(config)
-    config.compilation_config.pass_config.enable_sp = False
     config.compilation_config.cudagraph_mode.has_full_cudagraphs = lambda: False
     with pytest.raises(ValueError, match="FULL"):
         runtime.validate_leagle_runtime(config)
-
-
-def test_tp_proposals_use_rank_zero_without_changing_single_card(runtime, monkeypatch):
-    proposer = runtime.LEagleSpeculator.__new__(runtime.LEagleSpeculator)
-    calls = []
-    authoritative = torch.tensor([[3, 5, -1], [7, 9, 2]])
-
-    def broadcast(result, src):
-        calls.append(src)
-        result.copy_(authoritative)
-
-    distributed = ModuleType("vllm.distributed")
-    distributed.get_tp_group = lambda: SimpleNamespace(broadcast=broadcast)
-    monkeypatch.setitem(sys.modules, distributed.__name__, distributed)
-    result = torch.full_like(authoritative, -1)
-    proposer.target_tp_size = 1
-    assert proposer.synchronize_proposals(result) is result
-    assert not calls
-    proposer.target_tp_size = 2
-    assert proposer.synchronize_proposals(result) is result
-    assert calls == [0]
-    torch.testing.assert_close(result, authoritative)
-    proposer.synchronize_proposals(result[:0])
-    assert calls == [0]
 
 
 class CPUReplayBackend:

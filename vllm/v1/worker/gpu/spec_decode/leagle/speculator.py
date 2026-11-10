@@ -37,18 +37,13 @@ def validate_leagle_runtime(config):
     if any(
         getattr(parallel, name, 1) != 1
         for name in (
+            "tensor_parallel_size",
             "pipeline_parallel_size",
             "decode_context_parallel_size",
             "prefill_context_parallel_size",
         )
     ):
-        raise ValueError("LEAGLE currently requires PP=DCP=PCP=1")
-    compilation = getattr(config, "compilation_config", None)
-    passes = getattr(compilation, "pass_config", None)
-    if getattr(passes, "enable_sp", False) or getattr(
-        parallel, "use_sequence_parallel_moe", False
-    ):
-        raise ValueError("LEAGLE does not support sequence parallel target features")
+        raise ValueError("LEAGLE currently requires TP=PP=DCP=PCP=1")
     if spec.draft_parallel_config.tensor_parallel_size != 1:
         raise ValueError("LEAGLE currently requires draft TP=1")
     if config.model_config.hf_config.model_type != "qwen3":
@@ -88,7 +83,6 @@ class LEagleSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config, device):
         validate_leagle_runtime(vllm_config)
         super().__init__(vllm_config, device)
-        self.target_tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.draft_attn_layer_names: set[str] = set()
         self.attn_groups = []
         self.full_draft = (
@@ -321,20 +315,11 @@ class LEagleSpeculator(DraftModelSpeculator):
                 result[row, :count].copy_(tokens[0])
         if execution is not None:
             execution.update_batch(updates, self.graph_runner if full_draft else None)
-            result = execution.propose(
+            return execution.propose(
                 active,
                 last_sampled,
                 result,
                 count,
                 self.graph_runner if full_draft else None,
             )
-        return self.synchronize_proposals(result)
-
-    def synchronize_proposals(self, result):
-        # Every TP worker owns a complete draft. Keep verifier inputs identical
-        # even if independently initialized low-precision heads differ slightly.
-        if getattr(self, "target_tp_size", 1) > 1 and result.numel():
-            from vllm.distributed import get_tp_group
-
-            get_tp_group().broadcast(result, src=0)
         return result
