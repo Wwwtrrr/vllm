@@ -1112,3 +1112,41 @@ def test_private_quantized_head_dispatch_and_restart_guards():
     candidate = make_model(config)
     with pytest.raises(ValueError, match="cannot combine"):
         candidate.set_quantized_lm_head(PrivateHead())
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("rerank", [False, True])
+def test_quantized_svd_projection_preserves_bf16_reranking_and_restart_guards(rerank):
+    model = make_model(architecture(1, 1))
+    model.configure_output_head(svd_rank=8, top_k=3 if rerank else None, rerank=rerank)
+    hidden = torch.randn(2, 1, 16)
+    expected = model.select_greedy_token(hidden)
+    dense = model.lm_head.weight.clone()
+
+    class Projection(torch.nn.Module):
+        hidden_size, vocab_size = 8, 24
+        calls = 0
+
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", model.svd_candidate_head.up_weight.clone())
+
+        def forward(self, reduced):
+            self.calls += 1
+            return torch.nn.functional.linear(reduced, self.weight)
+
+    head = Projection()
+    model.set_quantized_svd_head(head)
+    torch.testing.assert_close(model.select_greedy_token(hidden), expected)
+    torch.testing.assert_close(model.lm_head.weight, dense)
+    assert head.calls == 1
+    assert model.quantized_lm_head is None
+    for change in (
+        lambda: model.set_quantized_svd_head(head),
+        lambda: model.configure_output_head(svd_rank=4),
+        lambda: model.set_svd_candidate_head(4, top_k=3),
+        lambda: model.configure_candidate_head(enabled=False),
+        lambda: model.load_weights([]),
+    ):
+        with pytest.raises(ValueError, match="restart"):
+            change()

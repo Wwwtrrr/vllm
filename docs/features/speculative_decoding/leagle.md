@@ -112,9 +112,34 @@ packing run during loading, before memory profiling and FULL capture. The
 private INT8 weight/scales are nonpersistent buffers and add resident memory;
 only inference weight traffic is reduced. They are rebuilt at startup, not
 saved to disk. Weight reload/scoring changes require engine restart/recapture.
-Candidate/SVD scoring cannot be combined with this option; disable candidate
-scoring and remove SVD rank for a full-head quantization experiment. Whole-draft
+With SVD enabled, W8A8 instead quantizes the SVD rank-to-vocabulary projection;
+the hidden-to-rank projection and candidate exact rescoring remain BF16.
+Trained candidate heads without an inference SVD head cannot use this option.
+Disable candidate scoring and remove SVD rank for full-head quantization. Whole-draft
 checkpoint quantization remains unsupported.
+
+For SVD plus W8A8 candidate retrieval, use:
+
+```python
+speculative_config = {
+    "method": "leagle",
+    "model": "/path/to/leagle/checkpoint",
+    "num_speculative_tokens": 7,
+    "leagle_candidate_svd_rank": 256,
+    "leagle_candidate_top_k": 128,
+    "leagle_candidate_rerank": True,
+    "leagle_lm_head_quantization": "w8a8",
+}
+```
+
+Rank and draft vocabulary size must be multiples of 32. Do not set
+`leagle_use_candidate_head=False` with SVD. With reranking disabled, omit TopK:
+the quantized coarse logits directly select the draft token. Dense LM head and
+BF16 SVD factors are retained. Loading, SVD construction and quantization happen
+before profiling/capture; scoring changes require restart. This path supports
+the existing eager/FULL execution, not multi-TP. Quantization may change the
+candidate set and acceptance length. Benchmark against identical SVD settings
+without W8A8; native performance and model acceptance require NPU validation.
 
 ```python
 speculative_config = {
