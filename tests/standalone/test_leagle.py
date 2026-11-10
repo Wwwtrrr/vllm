@@ -11,7 +11,6 @@ import importlib.util
 import inspect
 import os
 import sys
-import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -1113,7 +1112,6 @@ def test_sixteen_request_cache_update_is_one_replay_and_validation_is_atomic(ful
 def test_private_quantized_head_dispatch_and_restart_guards():
     model = make_model(architecture(1, 1))
     checkpoint = {key: value.clone() for key, value in model.state_dict().items()}
-    dense_weight = weakref.ref(model.lm_head.weight)
 
     class PrivateHead(torch.nn.Module):
         hidden_size, vocab_size = 16, 24
@@ -1125,14 +1123,14 @@ def test_private_quantized_head_dispatch_and_restart_guards():
             return output
 
     model.set_quantized_lm_head(PrivateHead())
-    assert model.lm_head is None
-    assert dense_weight() is None
-    assert "lm_head.weight" not in dict(model.named_parameters())
     with pytest.raises(ValueError, match="restart"):
         model.set_quantized_lm_head(PrivateHead())
     hidden = torch.randn(2, 1, 16)
-    assert (model.select_greedy_token(hidden) == 7).all()
-    assert set(checkpoint) - set(model.state_dict()) == {"lm_head.weight"}
+    with patch.object(
+        model.lm_head, "forward", side_effect=AssertionError("dense head called")
+    ):
+        assert (model.select_greedy_token(hidden) == 7).all()
+    assert checkpoint.keys() == model.state_dict().keys()
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, checkpoint[name])
     with pytest.raises(ValueError, match="restart"):
