@@ -1074,3 +1074,41 @@ def test_sixteen_request_cache_update_is_one_replay_and_validation_is_atomic(ful
     assert context.lengths[2] == 1 and context.request_ids[2] == "replacement"
     if full:
         assert manager.update_replays == 2
+
+
+@torch.inference_mode()
+def test_private_quantized_head_dispatch_and_restart_guards():
+    model = make_model(architecture(1, 1))
+    checkpoint = {key: value.clone() for key, value in model.state_dict().items()}
+
+    class PrivateHead(torch.nn.Module):
+        hidden_size, vocab_size = 16, 24
+
+        def forward(self, hidden):
+            # Controlled logits distinguish the private path from the dense head.
+            output = hidden.new_zeros(*hidden.shape[:-1], self.vocab_size)
+            output[..., 7] = 1
+            return output
+
+    model.set_quantized_lm_head(PrivateHead())
+    with pytest.raises(ValueError, match="restart"):
+        model.set_quantized_lm_head(PrivateHead())
+    hidden = torch.randn(2, 1, 16)
+    with patch.object(
+        model.lm_head, "forward", side_effect=AssertionError("dense head called")
+    ):
+        assert (model.select_greedy_token(hidden) == 7).all()
+    assert checkpoint.keys() == model.state_dict().keys()
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, checkpoint[name])
+    with pytest.raises(ValueError, match="restart"):
+        model.load_weights(checkpoint.items())
+    with pytest.raises(ValueError, match="cannot combine"):
+        model.set_svd_candidate_head(4, top_k=3)
+    with pytest.raises(ValueError, match="cannot combine"):
+        model.configure_candidate_head(enabled=True)
+    config = architecture(1, 1)
+    config.update(candidate_head=True, candidate_head_rank=4, candidate_head_top_k=3)
+    candidate = make_model(config)
+    with pytest.raises(ValueError, match="cannot combine"):
+        candidate.set_quantized_lm_head(PrivateHead())

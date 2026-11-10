@@ -313,6 +313,7 @@ class LEagleDraftModel(nn.Module):
             decoder.vocab_size, width, padding_idx=decoder.pad_token_id
         )
         self.lm_head = nn.Linear(width, self.draft_vocab_size, bias=False)
+        self.quantized_lm_head = None
         candidate = config.get("candidate_head", False)
         if type(candidate) is not bool:
             raise ValueError("LEAGLE candidate_head must be a boolean")
@@ -365,11 +366,33 @@ class LEagleDraftModel(nn.Module):
                 (*hidden_states.shape[:-1], self.draft_vocab_size), -torch.inf
             )
             return logits.scatter_(-1, candidates, scores)
+        if self.quantized_lm_head is not None:
+            return self.quantized_lm_head(hidden_states)
         return self.lm_head(hidden_states)
+
+    def set_quantized_lm_head(self, head):
+        if self.quantized_lm_head is not None:
+            raise ValueError(
+                "Replacing LEAGLE quantized head requires restart and recapture"
+            )
+        if self.candidate_head_enabled or self.svd_candidate_head is not None:
+            raise ValueError(
+                "LEAGLE quantized full head cannot combine with candidate/SVD scoring"
+            )
+        if (
+            head.hidden_size != self.lm_head.in_features
+            or head.vocab_size != self.draft_vocab_size
+        ):
+            raise ValueError("LEAGLE quantized head geometry mismatch")
+        self.quantized_lm_head = head
 
     def configure_output_head(
         self, *, svd_rank=None, enabled=None, top_k=None, rerank=None
     ):
+        if self.quantized_lm_head is not None:
+            raise ValueError(
+                "Changing LEAGLE quantized scoring requires restart and recapture"
+            )
         if svd_rank is not None:
             if enabled is False:
                 raise ValueError("SVD rank cannot disable the candidate head")
@@ -382,6 +405,8 @@ class LEagleDraftModel(nn.Module):
         self.configure_candidate_head(enabled, top_k, rerank)
 
     def set_svd_candidate_head(self, rank, *, top_k=128):
+        if self.quantized_lm_head is not None:
+            raise ValueError("LEAGLE SVD cannot combine with quantized full head")
         if self.training:
             raise ValueError("SVD head requires eval mode")
         if type(top_k) is not int or not 1 <= top_k <= self.draft_vocab_size:
@@ -390,6 +415,10 @@ class LEagleDraftModel(nn.Module):
         self.configure_candidate_head(enabled=True, top_k=top_k, rerank=True)
 
     def configure_candidate_head(self, enabled=None, top_k=None, rerank=None):
+        if enabled and self.quantized_lm_head is not None:
+            raise ValueError(
+                "LEAGLE candidate scoring cannot combine with quantized full head"
+            )
         selected_enabled = self.candidate_head_enabled if enabled is None else enabled
         selected_rerank = self.candidate_rerank if rerank is None else rerank
         if rerank is True and not selected_enabled:
@@ -730,6 +759,10 @@ class LEagleDraftModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load exact training names and reject incomplete inference checkpoints."""
+        if self.quantized_lm_head is not None:
+            raise ValueError(
+                "Reloading a quantized LEAGLE head requires restart and recapture"
+            )
         if self.svd_candidate_head is not None:
             raise ValueError(
                 "Reloading an SVD head requires restart and graph recapture"

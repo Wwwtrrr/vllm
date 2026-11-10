@@ -120,6 +120,7 @@ class LEagleSpeculator(DraftModelSpeculator):
             top_k=getattr(self.speculative_config, "leagle_candidate_top_k", None),
             rerank=getattr(self.speculative_config, "leagle_candidate_rerank", None),
         )
+        self.configure_lm_head_quantization()
         options = self.execution_options
         self.model.configure_inference(
             fused_projections=options.fused_projections,
@@ -195,6 +196,13 @@ class LEagleSpeculator(DraftModelSpeculator):
             return output.view_as(hidden)
 
         return rms_norm
+
+    def configure_lm_head_quantization(self):
+        if (
+            getattr(self.speculative_config, "leagle_lm_head_quantization", None)
+            is not None
+        ):
+            raise ValueError("LEAGLE W8A8 full head requires the Ascend speculator")
 
     def capture(self):
         if self.graph_runner is not None:

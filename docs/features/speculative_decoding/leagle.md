@@ -95,6 +95,43 @@ before using its latency as a serving benchmark.
 
 ## Inference optimizations
 
+### Ascend INT8 full-vocabulary head
+
+`leagle_lm_head_quantization="w8a8"` opts an Ascend BF16 LEAGLE drafter into a
+private online-quantized head. It retains every row of the draft vocabulary,
+uses per-output-channel symmetric INT8 weight scales and dynamically quantizes
+each hidden token to INT8. Native `npu_quant_matmul` returns BF16 logits for
+the existing greedy selector. The target model, original draft head and saved
+checkpoint are unchanged. This follows the private draft-head approach of
+vLLM PR #59973, but uses Ascend INT8 operators rather than FP8/NVFP4 CUDA kernels
+and is scoped to this LEAGLE implementation, not generic EAGLE/MTP/DSpark.
+
+Default is `None` (original BF16). Only BF16 heads with hidden/vocabulary sizes
+divisible by 32 are supported initially. Weight quantization and optional NZ
+packing run during loading, before memory profiling and FULL capture. The
+private INT8 weight/scales are nonpersistent buffers and add resident memory;
+only inference weight traffic is reduced. They are rebuilt at startup, not
+saved to disk. Weight reload/scoring changes require engine restart/recapture.
+Candidate/SVD scoring cannot be combined with this option; disable candidate
+scoring and remove SVD rank for a full-head quantization experiment. Whole-draft
+checkpoint quantization remains unsupported.
+
+```python
+speculative_config = {
+    "method": "leagle",
+    "model": "/path/to/leagle/checkpoint",
+    "num_speculative_tokens": 7,
+    "draft_sample_method": "greedy",
+    "leagle_use_candidate_head": False,
+    "leagle_lm_head_quantization": "w8a8",
+}
+```
+
+Eager and FULL use the same native projection. No CPU emulation is used in
+serving. Hardware validation must cover the installed CANN/torch_npu versions,
+graph replay, acceptance and TPOT; quantized token IDs need not equal BF16.
+The existing target verification path remains unchanged.
+
 ### Inference-only SVD head
 
 Dense LEAGLE checkpoints can derive an SVD retrieval head at startup, without

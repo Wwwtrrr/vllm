@@ -633,6 +633,8 @@ class SpeculativeConfig:
     """Derive inference-only SVD factors from loaded dense LM head before capture."""
     leagle_candidate_rerank: bool | None = None
     """True rescores candidates; false uses low-rank full-vocabulary logits."""
+    leagle_lm_head_quantization: Literal["w8a8"] | None = None
+    """Opt-in Ascend BF16 LEAGLE private INT8 full head; not FP8/NVFP4."""
 
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
@@ -668,6 +670,7 @@ class SpeculativeConfig:
                     self.leagle_candidate_top_k,
                     self.leagle_candidate_svd_rank,
                     self.leagle_candidate_rerank,
+                    self.leagle_lm_head_quantization,
                 )
             )
         if self.method == "dspark":
@@ -1630,6 +1633,12 @@ class SpeculativeConfig:
             self.draft_model_config.hf_config.index_share_for_mtp_iteration = (
                 self.index_share_for_mtp_iteration
             )
+
+        if self.leagle_lm_head_quantization is not None:
+            if self.method != "leagle":
+                raise ValueError("leagle_lm_head_quantization requires method='leagle'")
+            if self.leagle_candidate_svd_rank is not None:
+                raise ValueError("LEAGLE W8A8 cannot combine with SVD scoring")
 
         if (
             self.method != "dspark"
