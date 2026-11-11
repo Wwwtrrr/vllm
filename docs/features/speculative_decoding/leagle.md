@@ -118,6 +118,24 @@ Trained candidate heads without an inference SVD head cannot use this option.
 Disable candidate scoring and remove SVD rank for full-head quantization. Whole-draft
 checkpoint quantization remains unsupported.
 
+Optional memory saving: set `leagle_release_quantized_source=True` together with
+W8A8 (default false preserves the original behavior). After successful
+quantization, before memory profiling/capture:
+
+- Full-head W8A8 releases the dense BF16 draft LM head.
+- SVD W8A8 releases the BF16 SVD up-projection. With reranking enabled, the
+  original dense head remains necessary for exact candidate scores.
+- SVD W8A8 with reranking disabled also releases the unused dense draft head.
+
+The BF16 down-projection, target weights and checkpoint files are unchanged.
+For vocabulary 151936, hidden 2560 and rank 256, freed source storage is about
+742 MiB for full-head W8A8, 74 MiB for SVD with reranking, or 816 MiB for SVD
+without reranking. This is relative to retaining both representations, excludes
+other buffers, and does not lower peak memory during quantization itself.
+Allocator reservations may remain visible but can be reused. Restart is required
+to change the option; no dense fallback or weight reload is supported afterwards.
+The standalone benchmark still retains its BF16 baseline for comparisons.
+
 For SVD plus W8A8 candidate retrieval, use:
 
 ```python

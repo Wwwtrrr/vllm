@@ -374,7 +374,7 @@ class LEagleDraftModel(nn.Module):
             return self.quantized_lm_head(hidden_states)
         return self.lm_head(hidden_states)
 
-    def set_quantized_lm_head(self, head):
+    def set_quantized_lm_head(self, head, *, release_source=False):
         if self.quantized_lm_head is not None:
             raise ValueError(
                 "Replacing LEAGLE quantized head requires restart and recapture"
@@ -389,6 +389,8 @@ class LEagleDraftModel(nn.Module):
         ):
             raise ValueError("LEAGLE quantized head geometry mismatch")
         self.quantized_lm_head = head
+        if release_source:
+            self.lm_head = None
 
     def configure_output_head(
         self, *, svd_rank=None, enabled=None, top_k=None, rerank=None
@@ -461,7 +463,7 @@ class LEagleDraftModel(nn.Module):
             and self.svd_candidate_head.quantized_up is not None
         )
 
-    def set_quantized_svd_head(self, head):
+    def set_quantized_svd_head(self, head, *, release_source=False):
         if self.has_quantized_svd_head:
             raise ValueError("Replacing quantized SVD head requires restart")
         svd = self.svd_candidate_head
@@ -472,6 +474,10 @@ class LEagleDraftModel(nn.Module):
         if (head.hidden_size, head.vocab_size) != tuple(svd.up_weight.shape[::-1]):
             raise ValueError("Quantized SVD head geometry mismatch")
         svd.quantized_up = head
+        if release_source:
+            svd.up_weight = None
+            if not self.candidate_rerank:
+                self.lm_head = None
 
     def _coarse_logits(self, hidden_states):
         head = self.svd_candidate_head

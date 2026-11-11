@@ -635,6 +635,8 @@ class SpeculativeConfig:
     """True rescores candidates; false uses low-rank full-vocabulary logits."""
     leagle_lm_head_quantization: Literal["w8a8"] | None = None
     """Ascend INT8 full head, or SVD vocabulary up-projection when SVD is enabled."""
+    leagle_release_quantized_source: bool = False
+    """Release unused BF16 projection weights after W8A8 installation."""
 
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
@@ -671,6 +673,7 @@ class SpeculativeConfig:
                     self.leagle_candidate_svd_rank,
                     self.leagle_candidate_rerank,
                     self.leagle_lm_head_quantization,
+                    self.leagle_release_quantized_source,
                 )
             )
         if self.method == "dspark":
@@ -1636,6 +1639,10 @@ class SpeculativeConfig:
 
         if self.leagle_lm_head_quantization is not None and self.method != "leagle":
             raise ValueError("leagle_lm_head_quantization requires method='leagle'")
+        if self.leagle_release_quantized_source and (
+            self.method != "leagle" or self.leagle_lm_head_quantization != "w8a8"
+        ):
+            raise ValueError("leagle_release_quantized_source requires LEAGLE W8A8")
 
         if (
             self.method != "dspark"

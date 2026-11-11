@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import os
 import sys
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -1077,9 +1078,11 @@ def test_sixteen_request_cache_update_is_one_replay_and_validation_is_atomic(ful
 
 
 @torch.inference_mode()
-def test_private_quantized_head_dispatch_and_restart_guards():
+@pytest.mark.parametrize("release", [False, True])
+def test_private_quantized_head_dispatch_and_restart_guards(release):
     model = make_model(architecture(1, 1))
     checkpoint = {key: value.clone() for key, value in model.state_dict().items()}
+    source = weakref.ref(model.lm_head.weight)
 
     class PrivateHead(torch.nn.Module):
         hidden_size, vocab_size = 16, 24
@@ -1090,15 +1093,22 @@ def test_private_quantized_head_dispatch_and_restart_guards():
             output[..., 7] = 1
             return output
 
-    model.set_quantized_lm_head(PrivateHead())
+    model.set_quantized_lm_head(PrivateHead(), release_source=release)
+    assert (source() is None) == release
     with pytest.raises(ValueError, match="restart"):
         model.set_quantized_lm_head(PrivateHead())
     hidden = torch.randn(2, 1, 16)
-    with patch.object(
-        model.lm_head, "forward", side_effect=AssertionError("dense head called")
-    ):
+    if release:
+        assert model.lm_head is None
         assert (model.select_greedy_token(hidden) == 7).all()
-    assert checkpoint.keys() == model.state_dict().keys()
+    else:
+        with patch.object(
+            model.lm_head, "forward", side_effect=AssertionError("dense head called")
+        ):
+            assert (model.select_greedy_token(hidden) == 7).all()
+    assert set(checkpoint) - set(model.state_dict()) == (
+        {"lm_head.weight"} if release else set()
+    )
     for name, value in model.state_dict().items():
         torch.testing.assert_close(value, checkpoint[name])
     with pytest.raises(ValueError, match="restart"):
@@ -1116,12 +1126,17 @@ def test_private_quantized_head_dispatch_and_restart_guards():
 
 @torch.inference_mode()
 @pytest.mark.parametrize("rerank", [False, True])
-def test_quantized_svd_projection_preserves_bf16_reranking_and_restart_guards(rerank):
+@pytest.mark.parametrize("release", [False, True])
+def test_quantized_svd_projection_preserves_bf16_reranking_and_restart_guards(
+    rerank, release
+):
     model = make_model(architecture(1, 1))
     model.configure_output_head(svd_rank=8, top_k=3 if rerank else None, rerank=rerank)
     hidden = torch.randn(2, 1, 16)
     expected = model.select_greedy_token(hidden)
     dense = model.lm_head.weight.clone()
+    source = weakref.ref(model.svd_candidate_head.up_weight)
+    dense_source = weakref.ref(model.lm_head.weight)
 
     class Projection(torch.nn.Module):
         hidden_size, vocab_size = 8, 24
@@ -1136,9 +1151,12 @@ def test_quantized_svd_projection_preserves_bf16_reranking_and_restart_guards(re
             return torch.nn.functional.linear(reduced, self.weight)
 
     head = Projection()
-    model.set_quantized_svd_head(head)
+    model.set_quantized_svd_head(head, release_source=release)
+    assert (source() is None) == release
+    assert (dense_source() is None) == (release and not rerank)
     torch.testing.assert_close(model.select_greedy_token(hidden), expected)
-    torch.testing.assert_close(model.lm_head.weight, dense)
+    if model.lm_head is not None:
+        torch.testing.assert_close(model.lm_head.weight, dense)
     assert head.calls == 1
     assert model.quantized_lm_head is None
     for change in (
