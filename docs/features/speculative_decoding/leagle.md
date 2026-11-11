@@ -43,11 +43,46 @@ language model or enable generic EAGLE3 paged attention. Checkpoint tensor names
 and FULL graph boundaries are unchanged by the single-step interface.
 
 The implementation uses Model Runner V2, PyTorch SDPA, a Qwen3 target,
-TP=PP=DCP=PCP=1, and greedy draft proposals. Target sampling still uses
+equal target/draft TP, PP=DCP=PCP=1, and greedy draft proposals. Target sampling still uses
 vLLM's normal verifier/rejection sampler; greedy draft probabilities are one-hot.
 Prefix caching, remote KV transfer, target LoRA, watermarking, quantized drafts,
 parallel drafting and adaptive verification are rejected. Paged draft attention
 is not implemented.
+
+### Tensor parallelism
+
+Set `tensor_parallel_size=2` on the LLM (or `--tensor-parallel-size 2`). Draft TP
+defaults to the target TP; an explicit `draft_tensor_parallel_size` must equal
+it. A full training checkpoint is loaded directly: each worker slices its
+parameters at load time, without an offline checkpoint conversion.
+
+- Q/K/V and context/draft KV are partitioned by attention heads. When TP exceeds
+  the KV head count, KV heads are replicated across the appropriate ranks.
+- MLP gate/up projections split the intermediate dimension; down and attention
+  output projections reduce partial outputs, with output bias added once.
+- Embedding, LM head and candidate/SVD up-projections split vocabulary rows.
+  Local vocabulary partitions are padded to multiples of 32 and padding is
+  removed before global selection. Norms, feature/recurrent projections,
+  candidate/SVD down-projections and draft-to-target token maps are replicated.
+- Full/coarse logits are gathered over vocabulary. Candidate IDs are broadcast
+  from rank zero to resolve TopK tie ambiguity, then exact scores are reduced
+  from the owning vocabulary shards. Candidate rescoring never gathers the
+  original dense weight matrix.
+- SVD sums the FP64 Gram matrix over the TP CPU group and broadcasts a single
+  rank-zero basis before creating each rank's up-projection. W8A8 quantizes the
+  local vocabulary shard; optional source release retains the same semantics.
+
+Attention head and MLP dimensions must be compatible with TP. Mixed target/draft
+TP, sequence parallel features, PP/DCP/PCP and distributed checkpoint export are
+not supported. Target features/recurrent state remain full hidden vectors, so
+not every buffer shrinks with TP. TP=1 retains its dense operator paths.
+
+Eager and FULL use the same sharded model. Collectives participate in draft
+graphs; CUDA enters the TP communicator capture context on the private stream,
+while Ascend uses the native HCCL operations. CPU TP=2/4 algebra tests and a
+two-process Gloo rollout/SVD test cover checkpoint slicing and collectives.
+NCCL/HCCL graph correctness, real-checkpoint acceptance and TPOT require native
+hardware validation; multi-TP is not a performance guarantee at batch=1.
 
 For FULL target and draft graphs, remove `--enforce-eager` and add:
 
@@ -132,6 +167,8 @@ For vocabulary 151936, hidden 2560 and rank 256, freed source storage is about
 742 MiB for full-head W8A8, 74 MiB for SVD with reranking, or 816 MiB for SVD
 without reranking. This is relative to retaining both representations, excludes
 other buffers, and does not lower peak memory during quantization itself.
+These figures are for TP=1; with TP, per-rank savings follow the local vocabulary
+shard size (approximately divided by TP, with padding overhead).
 Allocator reservations may remain visible but can be reused. Restart is required
 to change the option; no dense fallback or weight reload is supported afterwards.
 The standalone benchmark still retains its BF16 baseline for comparisons.
@@ -155,7 +192,7 @@ Rank and draft vocabulary size must be multiples of 32. Do not set
 the quantized coarse logits directly select the draft token. Dense LM head and
 BF16 SVD factors are retained. Loading, SVD construction and quantization happen
 before profiling/capture; scoring changes require restart. This path supports
-the existing eager/FULL execution, not multi-TP. Quantization may change the
+the existing eager/FULL execution with equal target/draft TP. Quantization may change the
 candidate set and acceptance length. Benchmark against identical SVD settings
 without W8A8; native performance and model acceptance require NPU validation.
 

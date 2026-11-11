@@ -3,6 +3,7 @@
 """Fixed buffers and native graph replay for LEAGLE's complete draft rollout."""
 
 from bisect import bisect_left
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -51,11 +52,19 @@ class NativeLEagleGraphBackend:
         self.api, self.device, self.graph_class = api, device, graph_class
         self.pool = api.graph_pool_handle()
         self.stream = api.Stream(device=device)
+        self.tp_group = None
 
     def capture(self, forward):
         current = self.api.current_stream(self.device)
         self.stream.wait_stream(current)
-        with self.api.stream(self.stream):
+        communicator_capture = nullcontext()
+        if self.tp_group is not None and self.device.type == "cuda":
+            from vllm.distributed.parallel_state import GraphCaptureContext
+
+            communicator_capture = self.tp_group.graph_capture(
+                GraphCaptureContext(self.stream)
+            )
+        with self.api.stream(self.stream), communicator_capture:
             # Warm up lazy operator workspaces outside the capture region.
             for _ in range(2):
                 forward()

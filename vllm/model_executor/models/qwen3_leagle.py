@@ -11,11 +11,119 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import Qwen3Config
+from transformers.activations import ACT2FN
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3MLP,
     Qwen3RMSNorm,
     Qwen3RotaryEmbedding,
 )
+
+
+class LEagleTP:
+    """Use the serving TP group without importing distributed code on TP=1."""
+
+    def __init__(self, group=None):
+        self.group = group
+        self.size = group.world_size if group is not None else 1
+        self.rank = group.rank_in_group if group is not None else 0
+
+    def sum(self, tensor):
+        return self.group.all_reduce(tensor.contiguous()) if self.size > 1 else tensor
+
+    def gather(self, tensor):
+        return (
+            self.group.all_gather(tensor.contiguous(), dim=-1)
+            if self.size > 1
+            else tensor
+        )
+
+    def broadcast(self, tensor):
+        return self.group.broadcast(tensor, src=0) if self.size > 1 else tensor
+
+    def sum_cpu(self, tensor):
+        if self.size > 1:
+            torch.distributed.all_reduce(tensor, group=self.group.cpu_group)
+        return tensor
+
+    def broadcast_cpu(self, tensor):
+        if self.size > 1:
+            torch.distributed.broadcast(
+                tensor, src=self.group.ranks[0], group=self.group.cpu_group
+            )
+        return tensor
+
+    def vocab_rows(self, vocab):
+        if self.size == 1:
+            return vocab
+        return ((vocab + self.size - 1) // self.size + 31) // 32 * 32
+
+
+class LEagleColumnLinear(nn.Linear):
+    def __init__(self, width, output, tp, *, bias=False, replicas=1, vocab=False):
+        partitions = tp.size // replicas
+        if not vocab and output % partitions:
+            raise ValueError("LEAGLE projection size must divide TP partitions")
+        local = tp.vocab_rows(output) if vocab else output // partitions
+        super().__init__(width, local, bias=bias)
+        start = (tp.rank // replicas) * local
+        self._leagle_shards = {"weight": ((output, width), 0, start)}
+        if bias:
+            self._leagle_shards["bias"] = ((output,), 0, start)
+
+
+class LEagleRowLinear(nn.Linear):
+    def __init__(self, width, output, tp, *, bias=False):
+        if width % tp.size:
+            raise ValueError("LEAGLE row projection size must divide TP")
+        super().__init__(width // tp.size, output, bias=bias)
+        self.tp = tp
+        self._leagle_shards = {
+            "weight": ((output, width), 1, tp.rank * self.in_features)
+        }
+
+    def forward(self, hidden):
+        if self.tp.size == 1:
+            return F.linear(hidden, self.weight, self.bias)
+        output = self.tp.sum(F.linear(hidden, self.weight))
+        return output if self.bias is None else output + self.bias
+
+
+class LEagleEmbedding(nn.Embedding):
+    def __init__(self, vocab, width, tp, padding_idx):
+        local = tp.vocab_rows(vocab)
+        self.start = tp.rank * local
+        local_padding = (
+            padding_idx - self.start
+            if padding_idx is not None
+            and self.start <= padding_idx < self.start + local
+            else None
+        )
+        super().__init__(local, width, padding_idx=local_padding)
+        self.tp = tp
+        self._leagle_shards = {"weight": ((vocab, width), 0, self.start)}
+
+    def forward(self, ids):
+        if self.tp.size == 1:
+            return F.embedding(ids, self.weight, padding_idx=self.padding_idx)
+        local = ids - self.start
+        mask = (local >= 0) & (local < self.num_embeddings)
+        values = F.embedding(local.clamp(0, self.num_embeddings - 1), self.weight)
+        return self.tp.sum(torch.where(mask.unsqueeze(-1), values, 0))
+
+
+class LEagleTPMLP(nn.Module):
+    def __init__(self, config, tp):
+        super().__init__()
+        width, intermediate = config.hidden_size, config.intermediate_size
+        self.gate_proj = LEagleColumnLinear(width, intermediate, tp)
+        self.up_proj = LEagleColumnLinear(width, intermediate, tp)
+        self.down_proj = LEagleRowLinear(intermediate, width, tp)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, hidden):
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden)) * self.up_proj(hidden)
+        )
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -47,10 +155,11 @@ class LEagleRMSNorm(Qwen3RMSNorm):
 class LEagleCandidateHead(nn.Module):
     """Keep the trained low-rank retrieval parameter names unchanged."""
 
-    def __init__(self, width, vocab, rank):
+    def __init__(self, width, vocab, rank, tp=None):
         super().__init__()
+        tp = tp or LEagleTP()
         self.down_proj = nn.Linear(width, rank, bias=False)
-        self.up_proj = nn.Linear(rank, vocab, bias=False)
+        self.up_proj = LEagleColumnLinear(rank, vocab, tp, vocab=True)
 
     def forward(self, hidden):
         return self.up_proj(self.down_proj(hidden))
@@ -60,12 +169,14 @@ class LEagleSVDHead(nn.Module):
     """Inference-only WQ/Q.T factors; match looped_eagle's CPU FP64 Gram method."""
 
     @torch.no_grad()
-    def __init__(self, weight, rank):
+    def __init__(self, weight, rank, tp=None, total_vocab=None):
         super().__init__()
+        tp = tp or LEagleTP()
         if weight.is_meta or weight.ndim != 2 or not weight.is_floating_point():
             raise ValueError("SVD requires a loaded floating-point LM head")
         self.quantized_up = None
-        if type(rank) is not int or not 1 <= rank <= min(weight.shape):
+        limit = min(total_vocab or weight.shape[0], weight.shape[1])
+        if type(rank) is not int or not 1 <= rank <= limit:
             raise ValueError("SVD rank exceeds hidden/vocabulary size")
         started = time.perf_counter()
         logging.getLogger(__name__).info(
@@ -83,9 +194,14 @@ class LEagleSVDHead(nn.Module):
             gram.addmm_(rows.T, rows)
         if not torch.isfinite(gram).all():
             raise ValueError("SVD Gram matrix overflowed")
-        _, vectors = torch.linalg.eigh(gram)
-        basis = vectors[:, -rank:].flip(-1).contiguous()
-        del gram, vectors, rows
+        tp.sum_cpu(gram)
+        basis = torch.empty(width, rank, dtype=torch.float64, device="cpu")
+        if tp.rank == 0:
+            _, vectors = torch.linalg.eigh(gram)
+            basis.copy_(vectors[:, -rank:].flip(-1))
+            del vectors
+        tp.broadcast_cpu(basis)
+        del gram, rows
         up = torch.empty(vocab, rank, dtype=weight.dtype, device="cpu")
         for start in range(0, vocab, chunk):
             rows = weight[start : start + chunk].detach().to("cpu", torch.float64)
@@ -153,17 +269,30 @@ class LEagleStaticKV:
 
 
 class LEagleAttention(nn.Module):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3Config, layer_idx: int, tp=None):
         super().__init__()
+        tp = tp or LEagleTP()
         self.head_dim = config.head_dim
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        heads, kv_heads = config.num_attention_heads, config.num_key_value_heads
+        if (
+            heads % tp.size
+            or (kv_heads >= tp.size and kv_heads % tp.size)
+            or (kv_heads < tp.size and tp.size % kv_heads)
+        ):
+            raise ValueError("LEAGLE attention heads are incompatible with TP")
+        self.num_heads = heads // tp.size
+        self.num_kv_heads = max(1, kv_heads // tp.size)
         width = config.hidden_size
         bias = config.attention_bias
-        self.q_proj = nn.Linear(width, self.num_heads * self.head_dim, bias=bias)
-        self.k_proj = nn.Linear(width, self.num_kv_heads * self.head_dim, bias=bias)
-        self.v_proj = nn.Linear(width, self.num_kv_heads * self.head_dim, bias=bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, width, bias=bias)
+        replicas = max(1, tp.size // kv_heads)
+        self.q_proj = LEagleColumnLinear(width, heads * self.head_dim, tp, bias=bias)
+        self.k_proj = LEagleColumnLinear(
+            width, kv_heads * self.head_dim, tp, bias=bias, replicas=replicas
+        )
+        self.v_proj = LEagleColumnLinear(
+            width, kv_heads * self.head_dim, tp, bias=bias, replicas=replicas
+        )
+        self.o_proj = LEagleRowLinear(heads * self.head_dim, width, tp, bias=bias)
         self.q_norm = LEagleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = LEagleRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.register_buffer("_qkv_weight", None, persistent=False)
@@ -250,10 +379,11 @@ class LEagleAttention(nn.Module):
 
 
 class LEagleDecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3Config, layer_idx: int, tp=None):
         super().__init__()
-        self.self_attn = LEagleAttention(config, layer_idx)
-        self.mlp = Qwen3MLP(config)
+        tp = tp or LEagleTP()
+        self.self_attn = LEagleAttention(config, layer_idx, tp)
+        self.mlp = Qwen3MLP(config) if tp.size == 1 else LEagleTPMLP(config, tp)
         self.input_layernorm = LEagleRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -293,10 +423,20 @@ class LEagleDecoderLayer(nn.Module):
 
 
 class LEagleDraftModel(nn.Module):
-    """Single-device drafter; physical decoder weights are shared by loops."""
+    """Tensor-parallel drafter; physical decoder weights are shared by loops."""
 
-    def __init__(self, *, vllm_config, prefix: str = ""):
+    def __init__(self, *, vllm_config, prefix: str = "", tp_group=None):
         super().__init__()
+        size = getattr(
+            getattr(vllm_config, "parallel_config", None), "tensor_parallel_size", 1
+        )
+        if size > 1 and tp_group is None:
+            from vllm.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+        self.tp = LEagleTP(tp_group)
+        if self.tp.size != size:
+            raise ValueError("LEAGLE draft TP must match the worker TP group")
         hf_config = vllm_config.speculative_config.draft_model_config.hf_config
         self._init_architecture(hf_config.leagle_config)
 
@@ -313,10 +453,14 @@ class LEagleDraftModel(nn.Module):
         if not 0 < self.draft_vocab_size <= decoder.vocab_size:
             raise ValueError("LEAGLE draft vocabulary must fit the target vocabulary")
         width, eps = decoder.hidden_size, decoder.rms_norm_eps
-        self.embed_tokens = nn.Embedding(
-            decoder.vocab_size, width, padding_idx=decoder.pad_token_id
+        self.embed_tokens = LEagleEmbedding(
+            decoder.vocab_size, width, self.tp, decoder.pad_token_id
         )
-        self.lm_head = nn.Linear(width, self.draft_vocab_size, bias=False)
+        self.lm_head = LEagleColumnLinear(
+            width, self.draft_vocab_size, self.tp, vocab=True
+        )
+        self.local_vocab_size = self.lm_head.out_features
+        self.vocab_start = self.tp.rank * self.local_vocab_size
         self.quantized_lm_head = None
         candidate = config.get("candidate_head", False)
         if type(candidate) is not bool:
@@ -335,7 +479,7 @@ class LEagleDraftModel(nn.Module):
             ):
                 raise ValueError("LEAGLE candidate rank exceeds hidden/vocabulary size")
             self.candidate_head = LEagleCandidateHead(
-                width, self.draft_vocab_size, rank
+                width, self.draft_vocab_size, rank, self.tp
             )
             self.configure_candidate_head()
         self.fc = nn.Linear(len(self.target_layer_ids) * width, width, bias=False)
@@ -344,7 +488,8 @@ class LEagleDraftModel(nn.Module):
         self.state_norm = LEagleRMSNorm(width, eps=eps)
         self.input_fc = nn.Linear(2 * width, width, bias=False)
         self.layers = nn.ModuleList(
-            LEagleDecoderLayer(decoder, i) for i in range(decoder.num_hidden_layers)
+            LEagleDecoderLayer(decoder, i, self.tp)
+            for i in range(decoder.num_hidden_layers)
         )
         self.norm = LEagleRMSNorm(width, eps=eps)
         rope = getattr(decoder, "rope_parameters", None)
@@ -371,8 +516,14 @@ class LEagleDraftModel(nn.Module):
             )
             return logits.scatter_(-1, candidates, scores)
         if self.quantized_lm_head is not None:
-            return self.quantized_lm_head(hidden_states)
-        return self.lm_head(hidden_states)
+            local = self.quantized_lm_head(hidden_states)
+        else:
+            local = self.lm_head(hidden_states)
+        return (
+            self.tp.gather(local)[..., : self.draft_vocab_size]
+            if self.tp.size > 1
+            else local
+        )
 
     def set_quantized_lm_head(self, head, *, release_source=False):
         if self.quantized_lm_head is not None:
@@ -385,7 +536,7 @@ class LEagleDraftModel(nn.Module):
             )
         if (
             head.hidden_size != self.lm_head.in_features
-            or head.vocab_size != self.draft_vocab_size
+            or head.vocab_size != self.local_vocab_size
         ):
             raise ValueError("LEAGLE quantized head geometry mismatch")
         self.quantized_lm_head = head
@@ -419,7 +570,9 @@ class LEagleDraftModel(nn.Module):
             raise ValueError("SVD head requires eval mode")
         if type(top_k) is not int or not 1 <= top_k <= self.draft_vocab_size:
             raise ValueError("LEAGLE candidate top_k must be in [1, draft_vocab_size]")
-        self.svd_candidate_head = LEagleSVDHead(self.lm_head.weight, rank).eval()
+        self.svd_candidate_head = LEagleSVDHead(
+            self.lm_head.weight, rank, self.tp, self.draft_vocab_size
+        ).eval()
         self.configure_candidate_head(enabled=True, top_k=top_k, rerank=True)
 
     def configure_candidate_head(self, enabled=None, top_k=None, rerank=None):
@@ -483,7 +636,12 @@ class LEagleDraftModel(nn.Module):
         head = self.svd_candidate_head
         if head is None:
             head = self.candidate_head
-        return head(hidden_states)
+        local = head(hidden_states)
+        return (
+            self.tp.gather(local)[..., : self.draft_vocab_size]
+            if self.tp.size > 1
+            else local
+        )
 
     def _candidate_scores(self, hidden_states):
         candidates = (
@@ -491,8 +649,18 @@ class LEagleDraftModel(nn.Module):
             .topk(self.candidate_top_k, dim=-1, sorted=False)
             .indices
         )
-        rows = F.embedding(candidates, self.lm_head.weight)
+        candidates = self.tp.broadcast(candidates)
+        if self.tp.size == 1:
+            rows = F.embedding(candidates, self.lm_head.weight)
+            scores = torch.matmul(rows, hidden_states.unsqueeze(-1)).squeeze(-1)
+            return candidates, scores
+        local_ids = candidates - self.vocab_start
+        owned = (local_ids >= 0) & (local_ids < self.local_vocab_size)
+        rows = F.embedding(
+            local_ids.clamp(0, self.local_vocab_size - 1), self.lm_head.weight
+        )
         scores = torch.matmul(rows, hidden_states.unsqueeze(-1)).squeeze(-1)
+        scores = self.tp.sum(torch.where(owned, scores, 0))
         return candidates, scores
 
     def select_greedy_token(self, hidden_states):
@@ -801,6 +969,11 @@ class LEagleDraftModel(nn.Module):
                 "Reloading an SVD head requires restart and graph recapture"
             )
         tensors = dict(self.named_parameters())
+        shards = {
+            f"{name}.{parameter}": spec
+            for name, module in self.named_modules()
+            for parameter, spec in getattr(module, "_leagle_shards", {}).items()
+        }
         if self.d2t is not None:
             tensors["d2t"] = self.d2t
         loaded = set()
@@ -812,10 +985,21 @@ class LEagleDraftModel(nn.Module):
             if name not in tensors:
                 raise ValueError(f"Unexpected LEAGLE checkpoint tensor: {name}")
             target = tensors[name]
-            if target.shape != value.shape:
+            spec = shards.get(name)
+            expected = spec[0] if spec is not None else target.shape
+            if tuple(value.shape) != tuple(expected):
                 raise ValueError(f"LEAGLE shape mismatch for {name}: {value.shape}")
             with torch.no_grad():
-                target.copy_(value)
+                if spec is None:
+                    target.copy_(value)
+                else:
+                    _, dim, start = spec
+                    count = max(0, min(target.shape[dim], value.shape[dim] - start))
+                    target.zero_()
+                    if count:
+                        target.narrow(dim, 0, count).copy_(
+                            value.narrow(dim, start, count)
+                        )
             loaded.add(name)
         missing = tensors.keys() - loaded
         if missing:

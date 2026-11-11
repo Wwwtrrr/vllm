@@ -37,15 +37,20 @@ def validate_leagle_runtime(config):
     if any(
         getattr(parallel, name, 1) != 1
         for name in (
-            "tensor_parallel_size",
             "pipeline_parallel_size",
             "decode_context_parallel_size",
             "prefill_context_parallel_size",
         )
     ):
-        raise ValueError("LEAGLE currently requires TP=PP=DCP=PCP=1")
-    if spec.draft_parallel_config.tensor_parallel_size != 1:
-        raise ValueError("LEAGLE currently requires draft TP=1")
+        raise ValueError("LEAGLE currently requires PP=DCP=PCP=1")
+    if spec.draft_parallel_config.tensor_parallel_size != parallel.tensor_parallel_size:
+        raise ValueError("LEAGLE requires draft TP to equal target TP")
+    compilation = getattr(config, "compilation_config", None)
+    passes = getattr(compilation, "pass_config", None)
+    if getattr(passes, "enable_sp", False) or getattr(
+        parallel, "use_sequence_parallel_moe", False
+    ):
+        raise ValueError("LEAGLE does not support sequence parallel target features")
     if config.model_config.hf_config.model_type != "qwen3":
         raise ValueError("LEAGLE currently supports Qwen3 targets only")
     if config.cache_config.enable_prefix_caching:
@@ -183,7 +188,11 @@ class LEagleSpeculator(DraftModelSpeculator):
     def create_graph_backend(self):
         if self.device.type != "cuda":
             raise ValueError("Use the Ascend LEAGLE speculator for NPU graph capture")
-        return NativeLEagleGraphBackend(torch.cuda, self.device, torch.cuda.CUDAGraph)
+        backend = NativeLEagleGraphBackend(
+            torch.cuda, self.device, torch.cuda.CUDAGraph
+        )
+        backend.tp_group = self.model.tp.group
+        return backend
 
     def create_rmsnorm_impl(self):
         # Worker-only import keeps the CPU reference model independent of CUDA.

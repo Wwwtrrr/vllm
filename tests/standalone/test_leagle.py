@@ -10,10 +10,14 @@ import copy
 import importlib.util
 import inspect
 import os
+import subprocess
 import sys
 import weakref
-from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from pathlib import Path
+from threading import Barrier
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -367,7 +371,9 @@ def runtime_config():
         ("use_v2_model_runner", False, "Runner V2"),
         ("model_config.enforce_eager", False, "FULL"),
         ("cache_config.enable_prefix_caching", True, "prefix-caching"),
-        ("parallel_config.tensor_parallel_size", 2, "TP=PP"),
+        ("parallel_config.pipeline_parallel_size", 2, "PP=DCP"),
+        ("parallel_config.decode_context_parallel_size", 2, "PP=DCP"),
+        ("parallel_config.prefill_context_parallel_size", 2, "PP=DCP"),
         (
             "speculative_config.draft_parallel_config.tensor_parallel_size",
             2,
@@ -394,13 +400,20 @@ def test_unsupported_runtime_fails_explicitly(runtime, path, value, message):
         runtime.validate_leagle_runtime(config)
 
 
-def test_full_target_and_draft_configuration_is_accepted(runtime):
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_full_target_and_draft_configuration_is_accepted(runtime, tp):
     config = runtime_config()
+    config.parallel_config.tensor_parallel_size = tp
+    config.speculative_config.draft_parallel_config.tensor_parallel_size = tp
     config.model_config.enforce_eager = False
     config.compilation_config = SimpleNamespace(
         cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True)
     )
     runtime.validate_leagle_runtime(config)
+    config.compilation_config.pass_config = SimpleNamespace(enable_sp=True)
+    with pytest.raises(ValueError, match="sequence parallel"):
+        runtime.validate_leagle_runtime(config)
+    config.compilation_config.pass_config.enable_sp = False
     config.compilation_config.cudagraph_mode.has_full_cudagraphs = lambda: False
     with pytest.raises(ValueError, match="FULL"):
         runtime.validate_leagle_runtime(config)
@@ -1168,3 +1181,347 @@ def test_quantized_svd_projection_preserves_bf16_reranking_and_restart_guards(
     ):
         with pytest.raises(ValueError, match="restart"):
             change()
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [("num_attention_heads", 3, "heads"), ("intermediate_size", 33, "projection")],
+)
+def test_tp_rejects_incompatible_training_geometry(field, value, message):
+    config = architecture()
+    config["transformer_layer_config"][field] = value
+    cfg = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(leagle_config=config)
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match=message):
+        model_module.LEagleDraftModel(
+            vllm_config=cfg, tp_group=SimpleNamespace(world_size=2, rank_in_group=0)
+        )
+
+
+class ThreadTPCollectives:
+    """CPU algebra simulator; native tests must validate actual HCCL/NCCL graphs."""
+
+    def __init__(self, size):
+        self.size = size
+        self.barrier = Barrier(size, timeout=30)
+        self.inputs = [None] * size
+        self.output = None
+
+    def group(self, rank):
+        def collective(kind, tensor, dim=-1):
+            self.inputs[rank] = (kind, tensor.detach().clone(), dim)
+            self.barrier.wait()
+            if rank == 0:
+                assert all(item[0] == kind for item in self.inputs)
+                values = [item[1] for item in self.inputs]
+                self.output = (
+                    torch.cat(values, dim=dim)
+                    if kind == "gather"
+                    else values[0]
+                    if kind == "broadcast"
+                    else torch.stack(values).sum(0)
+                )
+            self.barrier.wait()
+            output = self.output.clone()
+            self.barrier.wait()
+            return output
+
+        return SimpleNamespace(
+            world_size=self.size,
+            rank_in_group=rank,
+            all_reduce=lambda tensor: collective("sum", tensor),
+            all_gather=lambda tensor, dim=-1: collective("gather", tensor, dim),
+            broadcast_cpu=lambda tensor: collective("broadcast", tensor),
+            broadcast=lambda tensor, src=0: collective("broadcast", tensor),
+        )
+
+    def run(self, function):
+        def safe(rank):
+            try:
+                return function(rank)
+            except BaseException:
+                self.barrier.abort()
+                raise
+
+        with ThreadPoolExecutor(max_workers=self.size) as pool:
+            futures = [pool.submit(safe, rank) for rank in range(self.size)]
+            return [future.result(timeout=60) for future in futures]
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("tp", [2, 4])
+@pytest.mark.parametrize("head", ["dense", "candidate", "svd", "quant", "svd_quant"])
+@pytest.mark.parametrize("kv_heads", [1, 2])
+def test_tp_checkpoint_shards_and_rollouts_match_dense(tp, head, kv_heads, monkeypatch):
+    config = architecture(2, 2, reduced=False, window=8)
+    config["transformer_layer_config"].update(
+        vocab_size=70, num_key_value_heads=kv_heads, attention_bias=True
+    )
+    config["draft_vocab_size"] = 37
+    if head == "candidate":
+        config.update(
+            candidate_head=True, candidate_head_rank=8, candidate_head_top_k=5
+        )
+    baseline = make_model(config)
+    checkpoint = {
+        name: tensor.clone() for name, tensor in baseline.state_dict().items()
+    }
+    hub = ThreadTPCollectives(tp)
+    models = []
+    for rank in range(tp):
+        hf = SimpleNamespace(leagle_config=config)
+        cfg = SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+            speculative_config=SimpleNamespace(
+                draft_model_config=SimpleNamespace(hf_config=hf)
+            ),
+        )
+        model = model_module.LEagleDraftModel(
+            vllm_config=cfg, tp_group=hub.group(rank)
+        ).eval()
+        model.load_weights(checkpoint.items())
+        assert model.layers[0].self_attn.q_proj.out_features == 16 // tp
+        assert model.layers[0].self_attn.num_kv_heads == max(1, kv_heads // tp)
+        assert model.layers[0].mlp.gate_proj.out_features == 32 // tp
+        assert model.lm_head.weight.shape == (32, 16)
+        assert model.embed_tokens.weight.shape == (model.tp.vocab_rows(70), 16)
+        models.append(model)
+
+    # Serving uses the CPU process group for FP64 initialization collectives.
+    def sum_cpu(context, tensor):
+        if context.size > 1:
+            tensor.copy_(context.group.all_reduce(tensor))
+        return tensor
+
+    def broadcast_cpu(context, tensor):
+        if context.size > 1:
+            tensor.copy_(context.group.broadcast_cpu(tensor))
+        return tensor
+
+    monkeypatch.setattr(model_module.LEagleTP, "sum_cpu", sum_cpu)
+    monkeypatch.setattr(model_module.LEagleTP, "broadcast_cpu", broadcast_cpu)
+    if head in ("svd", "svd_quant"):
+        baseline.configure_output_head(svd_rank=8, top_k=5, rerank=True)
+        hub.run(
+            lambda rank: models[rank].configure_output_head(
+                svd_rank=8, top_k=5, rerank=True
+            )
+        )
+    if head in ("quant", "svd_quant"):
+        # Exact projection stand-in tests local head routing/release; INT8
+        # numerical behavior is covered by Ascend operator contract tests.
+        class LocalHead(torch.nn.Module):
+            def __init__(self, weight):
+                super().__init__()
+                self.vocab_size, self.hidden_size = weight.shape
+                self.register_buffer("weight", weight.detach().clone())
+
+            def forward(self, hidden):
+                return torch.nn.functional.linear(hidden, self.weight)
+
+        for model in models:
+            if head == "quant":
+                model.set_quantized_lm_head(
+                    LocalHead(model.lm_head.weight), release_source=True
+                )
+                assert model.lm_head is None
+            else:
+                model.set_quantized_svd_head(
+                    LocalHead(model.svd_candidate_head.up_weight), release_source=True
+                )
+                assert model.svd_candidate_head.up_weight is None
+                assert model.lm_head is not None
+    context = torch.randn(2, 5, 16)
+    anchor = torch.tensor([[69], [2]])
+    hidden = torch.randn(2, 1, 16)
+    for fused in (False, True):
+        baseline.configure_inference(fused_projections=fused)
+        expected = baseline.propose_context(context, anchor, 3)
+        expected_logits = baseline.compute_logits(hidden)
+
+        @torch.inference_mode()
+        def rollout(rank, fused=fused):
+            model = models[rank]
+            model.configure_inference(fused_projections=fused)
+            return model.propose_context(context, anchor, 3), model.compute_logits(
+                hidden
+            )
+
+        for proposals, logits in hub.run(rollout):
+            torch.testing.assert_close(proposals, expected)
+            torch.testing.assert_close(logits, expected_logits, atol=2e-5, rtol=2e-5)
+
+
+def _gloo_tp_worker(rank, rendezvous):
+    torch.set_num_threads(1)
+    torch.manual_seed(42)
+    dist = torch.distributed
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=90),
+    )
+    try:
+
+        def reduce(tensor):
+            result = tensor.clone()
+            dist.all_reduce(result)
+            return result
+
+        def gather(tensor, dim=-1):
+            parts = [torch.empty_like(tensor) for _ in range(2)]
+            dist.all_gather(parts, tensor)
+            return torch.cat(parts, dim=dim)
+
+        def broadcast(tensor, src=0):
+            result = tensor.clone()
+            dist.broadcast(result, src=src)
+            return result
+
+        group = SimpleNamespace(
+            world_size=2,
+            rank_in_group=rank,
+            ranks=[0, 1],
+            cpu_group=dist.group.WORLD,
+            all_reduce=reduce,
+            all_gather=gather,
+            broadcast=broadcast,
+        )
+        config = architecture(2, 2, window=8)
+        config["transformer_layer_config"].update(
+            vocab_size=70, num_key_value_heads=1, attention_bias=True
+        )
+        config.update(
+            draft_vocab_size=37,
+            candidate_head=True,
+            candidate_head_rank=8,
+            candidate_head_top_k=5,
+        )
+        baseline = make_model(config)
+        cfg = SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=2),
+            speculative_config=SimpleNamespace(
+                draft_model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(leagle_config=config)
+                )
+            ),
+        )
+        shard = model_module.LEagleDraftModel(vllm_config=cfg, tp_group=group).eval()
+        shard.load_weights(baseline.state_dict().items())
+        assert sum(p.numel() for p in shard.parameters()) < sum(
+            p.numel() for p in baseline.parameters()
+        )
+        context = torch.randn(2, 5, 16)
+        anchor = torch.tensor([[69], [2]])
+        lengths = torch.tensor([5, 3])
+        with torch.inference_mode():
+            for head in ("dense", "candidate", "svd"):
+                for model in (baseline, shard):
+                    if head == "svd":
+                        model.configure_output_head(svd_rank=8, top_k=5, rerank=True)
+                    else:
+                        model.configure_candidate_head(enabled=head == "candidate")
+                    model.configure_inference(fused_projections=True)
+                expected = baseline.propose_static(context, lengths, anchor, 3)
+                actual = shard.propose_static(context, lengths, anchor, 3)
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(
+                    shard._coarse_logits(context)
+                    if head != "dense"
+                    else shard.compute_logits(context),
+                    baseline._coarse_logits(context)
+                    if head != "dense"
+                    else baseline.compute_logits(context),
+                    atol=2e-5,
+                    rtol=2e-5,
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Requires Gloo")
+def test_two_process_tp_rollouts_and_svd_initialization_match_dense(tmp_path):
+    """Real CPU collectives catch ordering/deadlock bugs, not NPU graph behavior."""
+    processes = []
+    logs = []
+    try:
+        for rank in range(2):
+            log = (tmp_path / f"rank_{rank}.log").open("w+", encoding="utf-8")
+            logs.append(log)
+            processes.append(
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--tp-worker",
+                        str(rank),
+                        (tmp_path / "rendezvous").as_uri(),
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                )
+            )
+        for process in processes:
+            process.wait(timeout=180)
+        for process, log in zip(processes, logs):
+            log.seek(0)
+            assert process.returncode == 0, log.read()
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=15)
+        for log in logs:
+            log.close()
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_private_graph_capture_uses_tp_communicator_context(device_type, monkeypatch):
+    module = ModuleType("vllm.distributed.parallel_state")
+    module.GraphCaptureContext = lambda stream: SimpleNamespace(stream=stream)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    stream = SimpleNamespace(wait_stream=lambda _: None)
+    entries = []
+
+    @contextmanager
+    def capture(context):
+        assert context.stream is stream
+        entries.append("enter")
+        yield
+        entries.append("exit")
+
+    api = SimpleNamespace(
+        graph_pool_handle=lambda: object(),
+        Stream=lambda **_: stream,
+        current_stream=lambda _: stream,
+        stream=lambda _: nullcontext(),
+        graph=lambda *args, **kwargs: nullcontext(),
+    )
+    backend = graph_module.NativeLEagleGraphBackend(
+        api, SimpleNamespace(type=device_type), object
+    )
+    backend.tp_group = SimpleNamespace(graph_capture=capture)
+    calls = []
+
+    def forward():
+        assert bool(entries) == (device_type == "cuda")
+        calls.append(1)
+        return len(calls)
+
+    _, output = backend.capture(forward)
+    assert output == 3
+    assert entries == (["enter", "exit"] if device_type == "cuda" else [])
+
+
+if __name__ == "__main__":
+    if sys.argv[1] != "--tp-worker":
+        raise ValueError("Expected --tp-worker")
+    _gloo_tp_worker(int(sys.argv[2]), sys.argv[3])
