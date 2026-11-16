@@ -60,17 +60,17 @@ parameters at load time, without an offline checkpoint conversion.
   the KV head count, KV heads are replicated across the appropriate ranks.
 - MLP gate/up projections split the intermediate dimension; down and attention
   output projections reduce partial outputs, with output bias added once.
-- Embedding, LM head and candidate/SVD up-projections split vocabulary rows.
+- Embedding, LM head and candidate up-projections split vocabulary rows.
   Local vocabulary partitions are padded to multiples of 32 and padding is
   removed before global selection. Norms, feature/recurrent projections,
-  candidate/SVD down-projections and draft-to-target token maps are replicated.
+  candidate down-projections and draft-to-target token maps are replicated.
 - Full/coarse logits are gathered over vocabulary. Candidate IDs are broadcast
   from rank zero to resolve TopK tie ambiguity, then exact scores are reduced
   from the owning vocabulary shards. Candidate rescoring never gathers the
   original dense weight matrix.
-- SVD sums the FP64 Gram matrix over the TP CPU group and broadcasts a single
-  rank-zero basis before creating each rank's up-projection. W8A8 quantizes the
-  local vocabulary shard; optional source release retains the same semantics.
+- W8A8 quantizes the local full-head or trained candidate up-projection;
+  optional source release retains the same semantics.
+
 
 Attention head and MLP dimensions must be compatible with TP. Mixed target/draft
 TP, sequence parallel features, PP/DCP/PCP and distributed checkpoint export are
@@ -80,7 +80,7 @@ not every buffer shrinks with TP. TP=1 retains its dense operator paths.
 Eager and FULL use the same sharded model. Collectives participate in draft
 graphs; CUDA enters the TP communicator capture context on the private stream,
 while Ascend uses the native HCCL operations. CPU TP=2/4 algebra tests and a
-two-process Gloo rollout/SVD test cover checkpoint slicing and collectives.
+two-process Gloo rollout test cover checkpoint slicing and collectives.
 NCCL/HCCL graph correctness, real-checkpoint acceptance and TPOT require native
 hardware validation; multi-TP is not a performance guarantee at batch=1.
 
@@ -147,55 +147,31 @@ packing run during loading, before memory profiling and FULL capture. The
 private INT8 weight/scales are nonpersistent buffers and add resident memory;
 only inference weight traffic is reduced. They are rebuilt at startup, not
 saved to disk. Weight reload/scoring changes require engine restart/recapture.
-With SVD enabled, W8A8 instead quantizes the SVD rank-to-vocabulary projection;
-the hidden-to-rank projection and candidate exact rescoring remain BF16.
-With a trained candidate head enabled and no SVD override, W8A8 quantizes its
-trained `candidate_head.up_proj` instead; the trained down-projection stays BF16.
-Disable candidate scoring and remove SVD rank for full-head quantization. Whole-draft
-checkpoint quantization remains unsupported.
+With a trained candidate head enabled, W8A8 quantizes its trained
+`candidate_head.up_proj`; the trained down-projection stays BF16. Disable
+candidate scoring for full-head quantization. Whole-draft checkpoint
+quantization remains unsupported.
 
 Optional memory saving: set `leagle_release_quantized_source=True` together with
 W8A8 (default false preserves the original behavior). After successful
 quantization, before memory profiling/capture:
 
 - Full-head W8A8 releases the dense BF16 draft LM head.
-- Candidate/SVD W8A8 releases the BF16 up-projection. With reranking enabled, the
+- Candidate W8A8 releases the BF16 up-projection. With reranking enabled, the
   original dense head remains necessary for exact candidate scores.
-- Candidate/SVD W8A8 with reranking disabled also releases the unused dense draft head.
+- Candidate W8A8 with reranking disabled also releases the unused dense draft head.
 
 The BF16 down-projection, target weights and checkpoint files are unchanged.
-For vocabulary 151936, hidden 2560 and rank 256, freed source storage is about
-742 MiB for full-head W8A8, 74 MiB for SVD with reranking, or 816 MiB for SVD
-without reranking. This is relative to retaining both representations, excludes
-other buffers, and does not lower peak memory during quantization itself.
+For vocabulary 151936, hidden 2560 and trained rank 640, freed source storage
+is about 742 MiB for full-head W8A8, 185 MiB for candidate reranking, or 927 MiB
+for direct candidate scoring. This is relative to retaining both
+representations, excludes other buffers, and does not lower peak memory during
+quantization itself.
 These figures are for TP=1; with TP, per-rank savings follow the local vocabulary
 shard size (approximately divided by TP, with padding overhead).
 Allocator reservations may remain visible but can be reused. Restart is required
 to change the option; no dense fallback or weight reload is supported afterwards.
 The standalone benchmark still retains its BF16 baseline for comparisons.
-
-For SVD plus W8A8 candidate retrieval, use:
-
-```python
-speculative_config = {
-    "method": "leagle",
-    "model": "/path/to/leagle/checkpoint",
-    "num_speculative_tokens": 7,
-    "leagle_candidate_svd_rank": 256,
-    "leagle_candidate_top_k": 128,
-    "leagle_candidate_rerank": True,
-    "leagle_lm_head_quantization": "w8a8",
-}
-```
-
-Rank and draft vocabulary size must be multiples of 32. Do not set
-`leagle_use_candidate_head=False` with SVD. With reranking disabled, omit TopK:
-the quantized coarse logits directly select the draft token. Dense LM head and
-BF16 SVD factors are retained. Loading, SVD construction and quantization happen
-before profiling/capture; scoring changes require restart. This path supports
-the existing eager/FULL execution with equal target/draft TP. Quantization may change the
-candidate set and acceptance length. Benchmark against identical SVD settings
-without W8A8; native performance and model acceptance require NPU validation.
 
 ```python
 speculative_config = {
@@ -213,50 +189,6 @@ serving. Hardware validation must cover the installed CANN/torch_npu versions,
 graph replay, acceptance and TPOT; quantized token IDs need not equal BF16.
 The existing target verification path remains unchanged.
 
-### Inference-only SVD head
-
-Dense LEAGLE checkpoints can derive an SVD retrieval head at startup, without
-candidate training, checkpoint conversion or random initialization:
-
-```python
-speculative_config = {
-    "method": "leagle",
-    "model": "/path/to/existing/leagle/checkpoint",
-    "num_speculative_tokens": 7,
-    "draft_sample_method": "greedy",
-    "leagle_candidate_svd_rank": 256,
-    "leagle_candidate_top_k": 256,
-}
-```
-
-After all dense weights load, CPU FP64 vocabulary chunks accumulate `W.T @ W`;
-`eigh` extracts leading right singular vectors `Q`. The inference buffers are
-`up_weight = W @ Q` and `down_weight = Q.T`, matching `looped_eagle`'s SVD
-implementation. They are nonpersistent, retain the LM head dtype/device and
-are built before memory profiling and FULL capture. No SVD enters a replay.
-The full original LM head stays available for exact candidate scoring.
-
-Default SVD scoring is low-rank Top-K retrieval followed by exact rescoring.
-Set `leagle_candidate_rerank=false` and omit `leagle_candidate_top_k` to predict
-directly from low-rank full-vocabulary logits instead. This second mode skips
-both Top-K and exact rescoring and can change predictions more substantially.
-Checkpoint `candidate_rerank` is also preserved for trained low-rank heads;
-an explicit SVD rank defaults to reranking regardless of checkpoint mode.
-
-Rank must not exceed the smaller weight dimension. SVD rank cannot be combined
-with `leagle_use_candidate_head=false`. For dense A/B runs, remove the SVD rank
-and set `leagle_use_candidate_head=false`; restart the engine for each variant.
-Changing rank/scoring or hot-reloading dense weights after SVD setup requires
-restart and recapture, preventing stale factors or captured pointers.
-
-Large weights can make FP64 CPU initialization take substantial time. Logs
-report initialization start/end; factors are rebuilt on each startup and are
-not saved to the checkpoint or a disk cache. Account for CPU workspaces and
-additional device factor memory: this does not reduce resident dense weights.
-Repeated eigenvalues may yield different bases across environments. Evaluate
-real hidden-state recall, acceptance, output quality and TPOT on the NPU; the
-factorization alone guarantees neither identical tokens nor a speedup.
-
 ### Trained candidate head
 
 Trained candidate-r640 plus W8A8 (rank is read from checkpoint metadata):
@@ -273,12 +205,11 @@ speculative_config = {
 }
 ```
 
-Do not set `leagle_candidate_svd_rank`: an SVD override selects different
-projections. Direct scoring (`rerank=False`) must omit the runtime TopK override.
+Direct scoring (`rerank=False`) must omit the runtime TopK override.
 To rescore candidates, set rerank true and optionally `leagle_candidate_top_k`.
 The trained BF16 down-projection feeds the INT8 up-projection; BF16 logits feed
 the existing global selector or TopK/BF16 exact rescoring. This uses the trained
-weights, not a fresh SVD. Rank (640 is valid) and local output rows must meet the
+weights. Rank (640 is valid) and local output rows must meet the
 existing multiples-of-32 kernel constraints. TP vocabulary shards and eager/FULL
 share this path. Unsupported checkpoint geometry fails rather than falling back.
 
@@ -368,3 +299,6 @@ vocabulary sizes, including padded static rollouts. CPU replay tests simulate
 buffer orchestration and do not validate a hardware graph runtime.
 GPU/NPU end-to-end serving and model-quality evaluation must
 also be run on the deployment machine with the actual trained checkpoint.
+
+Inference-time decomposition has been removed. Delete the obsolete
+`leagle_candidate_svd_rank` option from existing launch configurations.

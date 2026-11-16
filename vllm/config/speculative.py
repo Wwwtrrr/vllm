@@ -629,12 +629,10 @@ class SpeculativeConfig:
     """Use checkpoint candidate-head setting by default; false selects dense A/B."""
     leagle_candidate_top_k: int | None = Field(default=None, ge=1)
     """Override retrieval width for a trained LEAGLE candidate head."""
-    leagle_candidate_svd_rank: int | None = Field(default=None, ge=1)
-    """Derive inference-only SVD factors from loaded dense LM head before capture."""
     leagle_candidate_rerank: bool | None = None
     """True rescores candidates; false uses low-rank full-vocabulary logits."""
     leagle_lm_head_quantization: Literal["w8a8"] | None = None
-    """Ascend INT8 full head, or the enabled candidate/SVD vocabulary up-projection."""
+    """Ascend INT8 full head, or the enabled candidate vocabulary up-projection."""
     leagle_release_quantized_source: bool = False
     """Release unused BF16 projection weights after W8A8 installation."""
 
@@ -670,7 +668,6 @@ class SpeculativeConfig:
                     self.leagle_fused_rmsnorm,
                     self.leagle_use_candidate_head,
                     self.leagle_candidate_top_k,
-                    self.leagle_candidate_svd_rank,
                     self.leagle_candidate_rerank,
                     self.leagle_lm_head_quantization,
                     self.leagle_release_quantized_source,

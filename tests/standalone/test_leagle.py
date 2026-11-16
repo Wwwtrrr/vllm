@@ -487,7 +487,13 @@ def test_packed_projections_preserve_logits_and_checkpoint_names(dtype):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("candidate", [False, True, "svd", "svd_lowrank"])
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        False,
+        True,
+    ],
+)
 def test_optimized_serving_matches_reference_across_requests_and_rounds(
     runtime, full, reuse, static, batch, dtype, candidate
 ):
@@ -497,12 +503,6 @@ def test_optimized_serving_matches_reference_across_requests_and_rounds(
             candidate_head=True, candidate_head_rank=4, candidate_head_top_k=3
         )
     reference = make_model(config).to(dtype=dtype)
-    if candidate in ("svd", "svd_lowrank"):
-        reference.configure_output_head(
-            svd_rank=4,
-            top_k=3 if candidate == "svd" else None,
-            rerank=candidate == "svd",
-        )
     model = copy.deepcopy(reference)
     model.configure_inference(fused_projections=True)
     context = context_module.LEagleContext(3, 16, 16, dtype=dtype, device="cpu")
@@ -792,7 +792,14 @@ def test_full_draft_workspace_is_profiled_without_target_kv(runtime):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("candidate", [False, True, "low_rank", "svd", "svd_lowrank"])
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        False,
+        True,
+        "low_rank",
+    ],
+)
 def test_logits_match_real_training_code(
     layers, loops, norm, window, reduced, dtype, candidate, monkeypatch
 ):
@@ -858,12 +865,6 @@ def test_logits_match_real_training_code(
     inference.load_weights(training.state_dict().items())
     training.to(dtype=dtype)
     inference.to(dtype=dtype)
-    if candidate in ("svd", "svd_lowrank"):
-        training.set_svd_candidate_head(4, top_k=3)
-        inference.set_svd_candidate_head(4, top_k=3)
-        if candidate == "svd_lowrank":
-            training.set_candidate_head(True, rerank=False)
-            inference.configure_candidate_head(rerank=False)
     features, anchor = torch.randn(1, 9, 32, dtype=dtype), torch.tensor([[5]])
     expected, logits = training.propose(features, anchor, num_tokens=7)
     actual_logits = []
@@ -948,64 +949,6 @@ def test_invalid_candidate_geometry_rejected(key, value):
     config[key] = value
     with pytest.raises(ValueError, match="candidate"):
         make_model(config)
-
-
-@torch.inference_mode()
-def test_svd_factor_geometry_optimal_projection_and_ephemeral_state():
-    weight = torch.zeros(20, 6)
-    weight[:6] = torch.diag(torch.tensor([8.0, 5.0, 3.0, 2.0, 1.0, 0.5]))
-    head = model_module.LEagleSVDHead(weight, 2)
-    expected = weight.clone()
-    expected[2:] = 0
-    torch.testing.assert_close(head.up_weight @ head.down_weight, expected)
-    assert not head.state_dict()
-    assert not list(head.parameters())
-    full = model_module.LEagleSVDHead(weight, 6)
-    torch.testing.assert_close(full.up_weight @ full.down_weight, weight)
-    for invalid in (0, 7, True):
-        with pytest.raises(ValueError, match="rank"):
-            model_module.LEagleSVDHead(weight, invalid)
-    weight[0, 0] = float("nan")
-    with pytest.raises(ValueError, match="finite"):
-        model_module.LEagleSVDHead(weight, 2)
-
-
-@torch.inference_mode()
-def test_svd_runtime_configuration_dense_fallback_and_checkpoint_unchanged():
-    model = make_model(architecture(1, 1))
-    before = {name: value.clone() for name, value in model.state_dict().items()}
-    model.configure_output_head(svd_rank=4, top_k=3)
-    assert model.candidate_head is None
-    assert model.candidate_head_enabled and model.candidate_rerank
-    assert model.svd_candidate_head.down_weight.shape == (4, 16)
-    for name, value in model.state_dict().items():
-        torch.testing.assert_close(value, before[name])
-    assert model.state_dict().keys() == before.keys()
-    hidden = torch.randn(2, 1, 16)
-    expected = model.compute_logits(hidden).argmax(-1)
-    with patch.object(
-        model.lm_head, "forward", side_effect=AssertionError("dense head called")
-    ):
-        torch.testing.assert_close(model.select_greedy_token(hidden), expected)
-        model.configure_candidate_head(rerank=False)
-        torch.testing.assert_close(
-            model.compute_logits(hidden), model.svd_candidate_head(hidden)
-        )
-        torch.testing.assert_close(
-            model.select_greedy_token(hidden), model.compute_logits(hidden).argmax(-1)
-        )
-    model.configure_candidate_head(enabled=False)
-    torch.testing.assert_close(model.compute_logits(hidden), model.lm_head(hidden))
-    with pytest.raises(ValueError, match="restart"):
-        model.load_weights(before.items())
-    fresh = make_model(architecture())
-    with pytest.raises(ValueError, match="cannot disable"):
-        fresh.configure_output_head(svd_rank=4, enabled=False)
-    with pytest.raises(ValueError, match="requires candidate reranking"):
-        fresh.configure_output_head(svd_rank=4, top_k=3, rerank=False)
-    fresh.train()
-    with pytest.raises(ValueError, match="eval"):
-        fresh.set_svd_candidate_head(4, top_k=3)
 
 
 @pytest.mark.parametrize("full", [False, True])
@@ -1127,60 +1070,12 @@ def test_private_quantized_head_dispatch_and_restart_guards(release):
     with pytest.raises(ValueError, match="restart"):
         model.load_weights(checkpoint.items())
     with pytest.raises(ValueError, match="cannot combine"):
-        model.set_svd_candidate_head(4, top_k=3)
-    with pytest.raises(ValueError, match="cannot combine"):
         model.configure_candidate_head(enabled=True)
     config = architecture(1, 1)
     config.update(candidate_head=True, candidate_head_rank=4, candidate_head_top_k=3)
     candidate = make_model(config)
     with pytest.raises(ValueError, match="cannot combine"):
         candidate.set_quantized_lm_head(PrivateHead())
-
-
-@torch.inference_mode()
-@pytest.mark.parametrize("rerank", [False, True])
-@pytest.mark.parametrize("release", [False, True])
-def test_quantized_svd_projection_preserves_bf16_reranking_and_restart_guards(
-    rerank, release
-):
-    model = make_model(architecture(1, 1))
-    model.configure_output_head(svd_rank=8, top_k=3 if rerank else None, rerank=rerank)
-    hidden = torch.randn(2, 1, 16)
-    expected = model.select_greedy_token(hidden)
-    dense = model.lm_head.weight.clone()
-    source = weakref.ref(model.svd_candidate_head.up_weight)
-    dense_source = weakref.ref(model.lm_head.weight)
-
-    class Projection(torch.nn.Module):
-        hidden_size, vocab_size = 8, 24
-        calls = 0
-
-        def __init__(self):
-            super().__init__()
-            self.register_buffer("weight", model.svd_candidate_head.up_weight.clone())
-
-        def forward(self, reduced):
-            self.calls += 1
-            return torch.nn.functional.linear(reduced, self.weight)
-
-    head = Projection()
-    model.set_quantized_svd_head(head, release_source=release)
-    assert (source() is None) == release
-    assert (dense_source() is None) == (release and not rerank)
-    torch.testing.assert_close(model.select_greedy_token(hidden), expected)
-    if model.lm_head is not None:
-        torch.testing.assert_close(model.lm_head.weight, dense)
-    assert head.calls == 1
-    assert model.quantized_lm_head is None
-    for change in (
-        lambda: model.set_quantized_svd_head(head),
-        lambda: model.configure_output_head(svd_rank=4),
-        lambda: model.set_svd_candidate_head(4, top_k=3),
-        lambda: model.configure_candidate_head(enabled=False),
-        lambda: model.load_weights([]),
-    ):
-        with pytest.raises(ValueError, match="restart"):
-            change()
 
 
 @torch.inference_mode()
@@ -1221,7 +1116,6 @@ def test_trained_candidate_quantization_routes_and_releases_sources(rerank, rele
     head.hidden_size -= 1
     model.set_quantized_candidate_head(head, release_source=release)
     assert model.has_quantized_candidate_head
-    assert model.svd_candidate_head is None
     assert (source() is None) == release
     assert (dense_source() is None) == (release and not rerank)
     torch.testing.assert_close(model.select_greedy_token(hidden), expected)
@@ -1230,9 +1124,7 @@ def test_trained_candidate_quantization_routes_and_releases_sources(rerank, rele
         torch.testing.assert_close(model.lm_head.weight, dense)
     for change in (
         lambda: model.set_quantized_candidate_head(head),
-        lambda: model.configure_output_head(svd_rank=4),
-        lambda: model.set_svd_candidate_head(4, top_k=3),
-        lambda: model.set_quantized_svd_head(head),
+        lambda: model.configure_output_head(enabled=True),
         lambda: model.configure_candidate_head(enabled=False),
         lambda: model.load_weights([]),
     ):
@@ -1241,10 +1133,6 @@ def test_trained_candidate_quantization_routes_and_releases_sources(rerank, rele
     missing = make_model(architecture(1, 1))
     with pytest.raises(ValueError, match="trained head"):
         missing.set_quantized_candidate_head(head)
-    other = make_model(config)
-    other.configure_output_head(svd_rank=8, top_k=3, rerank=True)
-    with pytest.raises(ValueError, match="cannot combine"):
-        other.set_quantized_candidate_head(head)
 
 
 @pytest.mark.parametrize(
@@ -1301,7 +1189,6 @@ class ThreadTPCollectives:
             rank_in_group=rank,
             all_reduce=lambda tensor: collective("sum", tensor),
             all_gather=lambda tensor, dim=-1: collective("gather", tensor, dim),
-            broadcast_cpu=lambda tensor: collective("broadcast", tensor),
             broadcast=lambda tensor, src=0: collective("broadcast", tensor),
         )
 
@@ -1325,15 +1212,13 @@ class ThreadTPCollectives:
     [
         "dense",
         "candidate",
-        "svd",
         "quant",
-        "svd_quant",
         "candidate_quant",
         "candidate_quant_direct",
     ],
 )
 @pytest.mark.parametrize("kv_heads", [1, 2])
-def test_tp_checkpoint_shards_and_rollouts_match_dense(tp, head, kv_heads, monkeypatch):
+def test_tp_checkpoint_shards_and_rollouts_match_dense(tp, head, kv_heads):
     config = architecture(2, 2, reduced=False, window=8)
     config["transformer_layer_config"].update(
         vocab_size=70, num_key_value_heads=kv_heads, attention_bias=True
@@ -1371,56 +1256,6 @@ def test_tp_checkpoint_shards_and_rollouts_match_dense(tp, head, kv_heads, monke
         assert model.embed_tokens.weight.shape == (model.tp.vocab_rows(70), 16)
         models.append(model)
 
-    # Serving uses the CPU process group for FP64 initialization collectives.
-    def sum_cpu(context, tensor):
-        if context.size > 1:
-            tensor.copy_(context.group.all_reduce(tensor))
-        return tensor
-
-    def broadcast_cpu(context, tensor):
-        if context.size > 1:
-            tensor.copy_(context.group.broadcast_cpu(tensor))
-        return tensor
-
-    monkeypatch.setattr(model_module.LEagleTP, "sum_cpu", sum_cpu)
-    monkeypatch.setattr(model_module.LEagleTP, "broadcast_cpu", broadcast_cpu)
-    if head in ("svd", "svd_quant"):
-        baseline.configure_output_head(svd_rank=8, top_k=5, rerank=True)
-        hub.run(
-            lambda rank: models[rank].configure_output_head(
-                svd_rank=8, top_k=5, rerank=True
-            )
-        )
-    if head in ("quant", "svd_quant", "candidate_quant", "candidate_quant_direct"):
-        # Exact projection stand-in tests local head routing/release; INT8
-        # numerical behavior is covered by Ascend operator contract tests.
-        class LocalHead(torch.nn.Module):
-            def __init__(self, weight):
-                super().__init__()
-                self.vocab_size, self.hidden_size = weight.shape
-                self.register_buffer("weight", weight.detach().clone())
-
-            def forward(self, hidden):
-                return torch.nn.functional.linear(hidden, self.weight)
-
-        for model in models:
-            if head == "quant":
-                model.set_quantized_lm_head(
-                    LocalHead(model.lm_head.weight), release_source=True
-                )
-                assert model.lm_head is None
-            elif head == "svd_quant":
-                model.set_quantized_svd_head(
-                    LocalHead(model.svd_candidate_head.up_weight), release_source=True
-                )
-                assert model.svd_candidate_head.up_weight is None
-                assert model.lm_head is not None
-            else:
-                model.set_quantized_candidate_head(
-                    LocalHead(model.candidate_head.up_proj.weight), release_source=True
-                )
-                assert model.candidate_head.up_proj is None
-                assert (model.lm_head is None) == (head == "candidate_quant_direct")
     context = torch.randn(2, 5, 16)
     anchor = torch.tensor([[69], [2]])
     hidden = torch.randn(2, 1, 16)
@@ -1507,12 +1342,12 @@ def _gloo_tp_worker(rank, rendezvous):
         anchor = torch.tensor([[69], [2]])
         lengths = torch.tensor([5, 3])
         with torch.inference_mode():
-            for head in ("dense", "candidate", "svd"):
+            for head in (
+                "dense",
+                "candidate",
+            ):
                 for model in (baseline, shard):
-                    if head == "svd":
-                        model.configure_output_head(svd_rank=8, top_k=5, rerank=True)
-                    else:
-                        model.configure_candidate_head(enabled=head == "candidate")
+                    model.configure_candidate_head(enabled=head == "candidate")
                     model.configure_inference(fused_projections=True)
                 expected = baseline.propose_static(context, lengths, anchor, 3)
                 actual = shard.propose_static(context, lengths, anchor, 3)
@@ -1532,7 +1367,7 @@ def _gloo_tp_worker(rank, rendezvous):
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Requires Gloo")
-def test_two_process_tp_rollouts_and_svd_initialization_match_dense(tmp_path):
+def test_two_process_tp_rollouts_match_dense(tmp_path):
     """Real CPU collectives catch ordering/deadlock bugs, not NPU graph behavior."""
     processes = []
     logs = []
