@@ -1183,6 +1183,70 @@ def test_quantized_svd_projection_preserves_bf16_reranking_and_restart_guards(
             change()
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("rerank", [False, True])
+@pytest.mark.parametrize("release", [False, True])
+def test_trained_candidate_quantization_routes_and_releases_sources(rerank, release):
+    config = architecture(1, 1)
+    config.update(
+        candidate_head=True,
+        candidate_head_rank=8,
+        candidate_head_top_k=3,
+        candidate_rerank=rerank,
+    )
+    model = make_model(config)
+    hidden = torch.randn(2, 1, 16)
+    expected = model.select_greedy_token(hidden)
+    source = weakref.ref(model.candidate_head.up_proj.weight)
+    dense_source = weakref.ref(model.lm_head.weight)
+    dense = model.lm_head.weight.clone()
+    down = model.candidate_head.down_proj.weight.clone()
+
+    class Projection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vocab_size, self.hidden_size = (
+                model.candidate_head.up_proj.weight.shape
+            )
+            self.register_buffer("weight", model.candidate_head.up_proj.weight.clone())
+
+        def forward(self, reduced):
+            return torch.nn.functional.linear(reduced, self.weight)
+
+    head = Projection()
+    head.hidden_size += 1
+    with pytest.raises(ValueError, match="geometry"):
+        model.set_quantized_candidate_head(head, release_source=release)
+    assert model.candidate_head.up_proj is not None
+    head.hidden_size -= 1
+    model.set_quantized_candidate_head(head, release_source=release)
+    assert model.has_quantized_candidate_head
+    assert model.svd_candidate_head is None
+    assert (source() is None) == release
+    assert (dense_source() is None) == (release and not rerank)
+    torch.testing.assert_close(model.select_greedy_token(hidden), expected)
+    torch.testing.assert_close(model.candidate_head.down_proj.weight, down)
+    if model.lm_head is not None:
+        torch.testing.assert_close(model.lm_head.weight, dense)
+    for change in (
+        lambda: model.set_quantized_candidate_head(head),
+        lambda: model.configure_output_head(svd_rank=4),
+        lambda: model.set_svd_candidate_head(4, top_k=3),
+        lambda: model.set_quantized_svd_head(head),
+        lambda: model.configure_candidate_head(enabled=False),
+        lambda: model.load_weights([]),
+    ):
+        with pytest.raises(ValueError, match="restart"):
+            change()
+    missing = make_model(architecture(1, 1))
+    with pytest.raises(ValueError, match="trained head"):
+        missing.set_quantized_candidate_head(head)
+    other = make_model(config)
+    other.configure_output_head(svd_rank=8, top_k=3, rerank=True)
+    with pytest.raises(ValueError, match="cannot combine"):
+        other.set_quantized_candidate_head(head)
+
+
 @pytest.mark.parametrize(
     "field,value,message",
     [("num_attention_heads", 3, "heads"), ("intermediate_size", 33, "projection")],
@@ -1256,7 +1320,18 @@ class ThreadTPCollectives:
 
 @torch.inference_mode()
 @pytest.mark.parametrize("tp", [2, 4])
-@pytest.mark.parametrize("head", ["dense", "candidate", "svd", "quant", "svd_quant"])
+@pytest.mark.parametrize(
+    "head",
+    [
+        "dense",
+        "candidate",
+        "svd",
+        "quant",
+        "svd_quant",
+        "candidate_quant",
+        "candidate_quant_direct",
+    ],
+)
 @pytest.mark.parametrize("kv_heads", [1, 2])
 def test_tp_checkpoint_shards_and_rollouts_match_dense(tp, head, kv_heads, monkeypatch):
     config = architecture(2, 2, reduced=False, window=8)
@@ -1264,9 +1339,12 @@ def test_tp_checkpoint_shards_and_rollouts_match_dense(tp, head, kv_heads, monke
         vocab_size=70, num_key_value_heads=kv_heads, attention_bias=True
     )
     config["draft_vocab_size"] = 37
-    if head == "candidate":
+    if head in ("candidate", "candidate_quant", "candidate_quant_direct"):
         config.update(
-            candidate_head=True, candidate_head_rank=8, candidate_head_top_k=5
+            candidate_head=True,
+            candidate_head_rank=8,
+            candidate_head_top_k=5,
+            candidate_rerank=head != "candidate_quant_direct",
         )
     baseline = make_model(config)
     checkpoint = {
@@ -1313,7 +1391,7 @@ def test_tp_checkpoint_shards_and_rollouts_match_dense(tp, head, kv_heads, monke
                 svd_rank=8, top_k=5, rerank=True
             )
         )
-    if head in ("quant", "svd_quant"):
+    if head in ("quant", "svd_quant", "candidate_quant", "candidate_quant_direct"):
         # Exact projection stand-in tests local head routing/release; INT8
         # numerical behavior is covered by Ascend operator contract tests.
         class LocalHead(torch.nn.Module):
@@ -1331,12 +1409,18 @@ def test_tp_checkpoint_shards_and_rollouts_match_dense(tp, head, kv_heads, monke
                     LocalHead(model.lm_head.weight), release_source=True
                 )
                 assert model.lm_head is None
-            else:
+            elif head == "svd_quant":
                 model.set_quantized_svd_head(
                     LocalHead(model.svd_candidate_head.up_weight), release_source=True
                 )
                 assert model.svd_candidate_head.up_weight is None
                 assert model.lm_head is not None
+            else:
+                model.set_quantized_candidate_head(
+                    LocalHead(model.candidate_head.up_proj.weight), release_source=True
+                )
+                assert model.candidate_head.up_proj is None
+                assert (model.lm_head is None) == (head == "candidate_quant_direct")
     context = torch.randn(2, 5, 16)
     anchor = torch.tensor([[69], [2]])
     hidden = torch.randn(2, 1, 16)

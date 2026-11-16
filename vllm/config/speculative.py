@@ -634,7 +634,7 @@ class SpeculativeConfig:
     leagle_candidate_rerank: bool | None = None
     """True rescores candidates; false uses low-rank full-vocabulary logits."""
     leagle_lm_head_quantization: Literal["w8a8"] | None = None
-    """Ascend INT8 full head, or SVD vocabulary up-projection when SVD is enabled."""
+    """Ascend INT8 full head, or the enabled candidate/SVD vocabulary up-projection."""
     leagle_release_quantized_source: bool = False
     """Release unused BF16 projection weights after W8A8 installation."""
 

@@ -149,7 +149,8 @@ only inference weight traffic is reduced. They are rebuilt at startup, not
 saved to disk. Weight reload/scoring changes require engine restart/recapture.
 With SVD enabled, W8A8 instead quantizes the SVD rank-to-vocabulary projection;
 the hidden-to-rank projection and candidate exact rescoring remain BF16.
-Trained candidate heads without an inference SVD head cannot use this option.
+With a trained candidate head enabled and no SVD override, W8A8 quantizes its
+trained `candidate_head.up_proj` instead; the trained down-projection stays BF16.
 Disable candidate scoring and remove SVD rank for full-head quantization. Whole-draft
 checkpoint quantization remains unsupported.
 
@@ -158,9 +159,9 @@ W8A8 (default false preserves the original behavior). After successful
 quantization, before memory profiling/capture:
 
 - Full-head W8A8 releases the dense BF16 draft LM head.
-- SVD W8A8 releases the BF16 SVD up-projection. With reranking enabled, the
+- Candidate/SVD W8A8 releases the BF16 up-projection. With reranking enabled, the
   original dense head remains necessary for exact candidate scores.
-- SVD W8A8 with reranking disabled also releases the unused dense draft head.
+- Candidate/SVD W8A8 with reranking disabled also releases the unused dense draft head.
 
 The BF16 down-projection, target weights and checkpoint files are unchanged.
 For vocabulary 151936, hidden 2560 and rank 256, freed source storage is about
@@ -257,6 +258,38 @@ real hidden-state recall, acceptance, output quality and TPOT on the NPU; the
 factorization alone guarantees neither identical tokens nor a speedup.
 
 ### Trained candidate head
+
+Trained candidate-r640 plus W8A8 (rank is read from checkpoint metadata):
+
+```python
+speculative_config = {
+    "method": "leagle",
+    "model": "/path/to/leagle-candidate-r640",
+    "num_speculative_tokens": 7,
+    "leagle_use_candidate_head": True,
+    "leagle_candidate_rerank": False,
+    "leagle_lm_head_quantization": "w8a8",
+    "leagle_release_quantized_source": True,
+}
+```
+
+Do not set `leagle_candidate_svd_rank`: an SVD override selects different
+projections. Direct scoring (`rerank=False`) must omit the runtime TopK override.
+To rescore candidates, set rerank true and optionally `leagle_candidate_top_k`.
+The trained BF16 down-projection feeds the INT8 up-projection; BF16 logits feed
+the existing global selector or TopK/BF16 exact rescoring. This uses the trained
+weights, not a fresh SVD. Rank (640 is valid) and local output rows must meet the
+existing multiples-of-32 kernel constraints. TP vocabulary shards and eager/FULL
+share this path. Unsupported checkpoint geometry fails rather than falling back.
+
+Source release defaults to false. When enabled, the trained BF16 up-projection
+is removed after quantization; the dense head is also removed only for direct
+scoring. For TP=1, vocab 151936 and rank 640, the up-projection source is about
+185 MiB; direct scoring can additionally release the roughly 742 MiB dense head
+at hidden size 2560. Startup peak memory still includes source and quantized
+weights. Checkpoint files stay unchanged; reload or scoring changes require
+restart/recapture. Quantization can change candidate recall, acceptance and TPOT;
+CPU tests do not establish native performance or model quality.
 
 Checkpoints with `candidate_head=true` now use the trained
 `candidate_head.down_proj.weight` and `candidate_head.up_proj.weight` for low-rank
