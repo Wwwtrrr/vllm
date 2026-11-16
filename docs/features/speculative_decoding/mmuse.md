@@ -615,3 +615,31 @@ rollback, eviction and request reuse, with optional native replay tests.
 Validate native numerical accuracy, acceptance and steady-state ITL/TPOT on the
 server: padding, input copies, extra graph memory and commits can offset launch
 savings, so capture success alone is not a performance result.
+
+### Joint Correction and Markov vocabulary projection
+
+For an inference-only experiment, set
+`"correction_markov_projection_fusion": true` in the Draft checkpoint's
+`config.json` (prefer a separate configuration copy for A/B runs). This defaults
+to false and requires logits Correction, `correction_with_markov=true`, vanilla
+Markov and `correction_project_corrected_hidden=false`. It is separate from
+`correction_lm_head_fusion`; do not enable corrected-hidden projection for this
+experiment. Existing weights and Feedback options are retained.
+
+The original residual `gate_c * U(q) + gate_m * M(e)` becomes one projection
+`[U M]([gate_c*q; gate_m*e])`. Gates are applied to low-rank features rather than
+vocabulary-sized tensors. The Correction bottleneck is also reused for hidden
+Feedback. The two independently trained heads are concatenated, not tied or
+summed. The base LM head, Selector and distribution Feedback remain unchanged.
+Training/grad-enabled calls retain the original path.
+
+Concatenated weights are lazily cached during eager warmup and reused by FULL
+capture/replay on either platform. Normal tensor version counters, storage,
+device and dtype changes invalidate this cache on the next eager call; inference
+tensors without counters must remain immutable. Restart/re-capture after changing
+weights or this option. Checkpoints retain only the original parameters.
+At vocabulary 129280, two ranks of 256 and BF16, the extra cached matrix occupies
+about 126.25 MiB per worker. Two rank-to-vocabulary GEMMs become one wider GEMM;
+their main FLOPs are unchanged. BF16 rounding and addition order change, so test
+logits, candidate decisions, acceptance length and unprofiled ITL/TPOT before
+using it for production. No native speedup or bitwise equality is implied.

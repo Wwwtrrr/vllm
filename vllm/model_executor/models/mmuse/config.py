@@ -166,6 +166,13 @@ class MMuseOptions(MMuseBackboneConfigMixin):
             "Training and the default disabled path are unchanged."
         ),
     )
+    correction_markov_projection_fusion: bool = Field(
+        default=False,
+        description=(
+            "In no-grad logits rollout, gate low-rank Correction and vanilla "
+            "Markov features before one concatenated vocabulary projection."
+        ),
+    )
     correction_num_layers: int = Field(
         default=1,
         gt=0,
@@ -277,6 +284,8 @@ def validate_mmuse_options(values: Mapping[str, Any], *, partial: bool = False) 
     markov_head_type = context("markov_head_type")
     _validate_selector_dependencies(options, markov_rank)
     _validate_correction_dependencies(options)
+    if options.correction_markov_projection_fusion and markov_head_type != "vanilla":
+        raise ValueError("Joint vocabulary projection requires vanilla Markov")
     if options.correction_with_markov:
         if not correction:
             raise ValueError("correction_with_markov=True requires Correction")
@@ -325,6 +334,16 @@ def _validate_selector_dependencies(options: MMuseOptions, markov_rank: int) -> 
 
 def _validate_correction_dependencies(options: MMuseOptions) -> None:
     correction = options.enable_correction_head
+    if options.correction_markov_projection_fusion and not (
+        correction
+        and options.correction_output_mode == "logits"
+        and options.correction_with_markov
+        and not options.correction_project_corrected_hidden
+    ):
+        raise ValueError(
+            "correction_markov_projection_fusion requires logits Correction, "
+            "vanilla collaborative Markov and no corrected-hidden projection"
+        )
     if correction and options.correction_hidden_size % options.correction_num_heads:
         raise ValueError(
             "correction_hidden_size must be divisible by correction_num_heads"

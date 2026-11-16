@@ -29,6 +29,46 @@ _BLOCK_HIDDEN_RANK = 3
 
 
 class MMuseRuntime(MMuseBackboneMixin, nn.Module):
+    def _uses_joint_vocabulary_projection(self) -> bool:
+        return (
+            getattr(self.config, "correction_markov_projection_fusion", False)
+            and not torch.is_grad_enabled()
+        )
+
+    def _joint_vocabulary_residual(self, low_rank, states, previous_ids):
+        """Project gated features with the original, independently trained heads."""
+        weights = (
+            self.correction_head.correction_up.weight,
+            self.markov_head.markov_w2.weight,
+        )
+        signature = []
+        for weight in weights:
+            try:
+                version = weight._version
+            except RuntimeError:
+                version = None
+            signature.append(
+                (weight.data_ptr(), version, weight.device, weight.dtype, weight.shape)
+            )
+        signature = tuple(signature)
+        if signature != getattr(self, "_joint_projection_signature", None):
+            self._joint_projection_weight = torch.cat(
+                [weight.detach() for weight in weights], dim=1
+            )
+            self._joint_projection_signature = signature
+        correction_gate = torch.sigmoid(self.correction_head.residual_gate(states))
+        previous_embedding = self.markov_head.prev_embeddings(previous_ids)
+        previous_embedding = previous_embedding.to(weights[1].dtype)
+        markov_gate = torch.tanh(self.correction_markov_scale) * torch.sigmoid(
+            self.correction_markov_gate(
+                states.to(self.correction_markov_gate.weight.dtype)
+            )
+        )
+        features = torch.cat(
+            (low_rank * correction_gate, previous_embedding * markov_gate), dim=-1
+        )
+        return torch.nn.functional.linear(features, self._joint_projection_weight)
+
     def _init_sequential_heads(self, config: MMuseRuntimeConfig) -> None:
         validate_mmuse_options(vars(config))
         hidden_size = config.transformer_layer_config.hidden_size
@@ -441,13 +481,15 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
         cache: CorrectionCache | None,
         precomputed_base_logits: torch.Tensor | None = None,
         fused_base_logits: torch.Tensor | None = None,
+        joint_previous_ids: torch.Tensor | None = None,
         **correction_kwargs: torch.Tensor,
     ) -> CorrectionStepOutput:
         """Compute one Correction residual and its final vocabulary projection.
 
         The caller supplies independent residual/input hidden slices to preserve
-        autograd accumulation order. Selector conditioning, Markov collaboration,
-        sampling and feedback-state updates remain in the rollout loop.
+        autograd accumulation order. Joint projection includes vanilla Markov;
+        otherwise collaboration stays in the caller. Sampling and feedback-state
+        updates remain in the rollout loop.
         """
         correction_output_mode = getattr(self.correction_head, "output_mode", "hidden")
         hidden_auxiliary_enabled = getattr(
@@ -459,12 +501,15 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
         project_corrected_hidden = getattr(
             self.config, "correction_project_corrected_hidden", False
         )
+        joint_projection = joint_previous_ids is not None
+        projection_kwargs = {"return_low_rank": True} if joint_projection else {}
         residual, causal_states, next_cache = self.correction_head(
             previous_embeddings,
             correction_hidden,
             block_positions,
             cache=cache,
             use_cache=True,
+            **projection_kwargs,
             **correction_kwargs,
         )
         if correction_output_mode == "logits":
@@ -475,6 +520,7 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
             ):
                 delta_hidden = self.correction_head.auxiliary_hidden_residual(
                     causal_states,
+                    **({"low_rank": residual} if joint_projection else {}),
                 )
                 corrected_current_hidden = current_hidden + delta_hidden[:, 0].to(
                     current_hidden.dtype
@@ -493,6 +539,10 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
             else:
                 projected_logits = self.lm_head(
                     projection_hidden.to(self.lm_head.weight.dtype)
+                )
+            if joint_projection:
+                residual = self._joint_vocabulary_residual(
+                    residual, causal_states, joint_previous_ids
                 )
             final_logits = projected_logits + residual[:, 0].to(projected_logits.dtype)
         else:
@@ -692,6 +742,11 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                     cache=cache,
                     precomputed_base_logits=precomputed_base_logits,
                     fused_base_logits=fused_base_logits,
+                    joint_previous_ids=(
+                        step_previous_ids.unsqueeze(1)
+                        if self._uses_joint_vocabulary_projection()
+                        else None
+                    ),
                     **current_token_kwargs,
                     **feedback_kwargs,
                 )
@@ -700,7 +755,7 @@ class MMuseRuntime(MMuseBackboneMixin, nn.Module):
                 corrected_current_hidden = step.corrected_hidden
                 cache = step.cache
                 del step  # Match the previous tuple-unpacking tensor lifetimes.
-                if has_markov_head:
+                if has_markov_head and not self._uses_joint_vocabulary_projection():
                     final_logits, _, _ = self._apply_collaborative_markov(
                         final_logits.unsqueeze(1),
                         causal_states.unsqueeze(1),

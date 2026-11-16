@@ -422,6 +422,8 @@ class CausalCorrectionHead(nn.Module):
     def auxiliary_hidden_residual(
         self,
         causal_states: torch.Tensor,
+        *,
+        low_rank: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project Correction states to an auxiliary DFlash-hidden residual."""
         if self.output_mode == "hidden":
@@ -430,7 +432,9 @@ class CausalCorrectionHead(nn.Module):
             raise RuntimeError(
                 "Auxiliary hidden residual was not enabled for logit Correction"
             )
-        common_states = silu(self.correction_down(causal_states))
+        common_states = (
+            silu(self.correction_down(causal_states)) if low_rank is None else low_rank
+        )
         delta_hidden = self.auxiliary_hidden_up(common_states)
         return delta_hidden * torch.sigmoid(self.auxiliary_hidden_gate(causal_states))
 
@@ -543,12 +547,15 @@ class CausalCorrectionHead(nn.Module):
         cache: CorrectionCache | None = None,
         *,
         use_cache: bool = False,
+        return_low_rank: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, CorrectionCache | None]:
         """Return ``(delta, causal_states, next_cache)``.
 
         ``delta`` is hidden-sized in hidden mode and draft-vocabulary-sized in
         logits mode. The latter requires previous logits plus a validity mask so
         block position zero can use an explicit no-history feature.
+        With return_low_rank, return the activated bottleneck instead of delta
+        for the inference caller to project together with a Markov feature.
         """
         validate_correction_embeddings(
             previous_token_embeddings,
@@ -593,5 +600,9 @@ class CausalCorrectionHead(nn.Module):
                 next_cache.append(next_layer_cache)
 
         causal_states = self.output_norm(hidden_states)
-        delta = self._residual_from_causal_states(causal_states)
+        delta = (
+            silu(self.correction_down(causal_states))
+            if return_low_rank
+            else self._residual_from_causal_states(causal_states)
+        )
         return delta, causal_states, next_cache if use_cache else None

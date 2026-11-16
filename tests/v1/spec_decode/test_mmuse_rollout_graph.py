@@ -12,7 +12,7 @@ import torch
 MODELS = Path(__file__).resolve().parents[3] / "vllm/model_executor/models"
 
 
-def runtime(device, fusion, monkeypatch):
+def runtime(device, fusion, monkeypatch, *, joint_projection=False):
     for package, path in (
         ("vllm", MODELS.parents[1]),
         ("vllm.model_executor", MODELS.parent),
@@ -53,6 +53,12 @@ def runtime(device, fusion, monkeypatch):
         "dflash2_selector_top_k": 4,
         "selector_correction_feedback": "corrected",
     }
+    if joint_projection:
+        config.update(
+            correction_output_mode="logits",
+            correction_with_markov=True,
+            correction_markov_projection_fusion=True,
+        )
     model = module.MMuseRuntime(config, torch.nn.Linear(32, 16))
     model.embed_tokens = torch.nn.Embedding(32, 16)
     model.lm_head = torch.nn.Linear(16, 32, bias=False)
@@ -60,11 +66,13 @@ def runtime(device, fusion, monkeypatch):
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
-@pytest.mark.parametrize("fusion", [False, True])
+@pytest.mark.parametrize(
+    "fusion,joint_projection", [(False, False), (True, False), (False, True)]
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
 def test_rollout_graph_reads_changed_anchors_and_hidden_rows(
-    device, fusion, dtype, monkeypatch
+    device, fusion, joint_projection, dtype, monkeypatch
 ):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA hardware required")
@@ -74,7 +82,13 @@ def test_rollout_graph_reads_changed_anchors_and_hidden_rows(
             pytest.skip("NPU hardware required")
     backend = getattr(torch, device, None)
     torch.manual_seed(12)
-    model = runtime(device, fusion, monkeypatch).to(dtype=dtype)
+    model = runtime(device, fusion, monkeypatch, joint_projection=joint_projection).to(
+        dtype=dtype
+    )
+    if joint_projection:
+        model.correction_head.correction_up.weight.normal_(std=0.08)
+        model.correction_head.auxiliary_hidden_up.weight.normal_(std=0.08)
+        model.correction_markov_scale.fill_(0.7)
     hidden = torch.randn(4, 3, 16, device=device, dtype=dtype)
     anchors = torch.tensor([1, 2, 3, 4], device=device)
     output = torch.empty(4, 3, dtype=torch.long, device=device)
@@ -113,3 +127,89 @@ def test_rollout_graph_reads_changed_anchors_and_hidden_rows(
         torch.testing.assert_close(scores, logits, atol=2e-4, rtol=2e-4)
         single, _ = model.rollout_correction(hidden[:1], anchors[:1])
         torch.testing.assert_close(output[:1], single)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_joint_vocabulary_projection_preserves_feedback_rollout(dtype, monkeypatch):
+    """Independent nonzero heads and gates must survive the combined projection."""
+    torch.manual_seed(19)
+    model = runtime("cpu", False, monkeypatch, joint_projection=True).to(dtype=dtype)
+    with torch.no_grad():
+        model.correction_head.correction_up.weight.normal_(std=0.08)
+        model.correction_head.auxiliary_hidden_up.weight.normal_(std=0.08)
+        model.correction_head.residual_gate.weight.normal_(std=0.1)
+        model.correction_head.auxiliary_hidden_gate.weight.normal_(std=0.1)
+        model.correction_markov_scale.fill_(0.7)
+        model.correction_markov_gate.weight.normal_(std=0.1)
+    for batch in (1, 3):
+        hidden = torch.randn(batch, 3, 16, dtype=dtype)
+        anchors = torch.arange(batch) + 2
+        # Fix previous-token conditioning to isolate numeric feedback differences
+        # from discontinuous argmax changes; still compare candidate decisions.
+        previous_ids = torch.tensor([[2, 3, 4]]).expand(batch, -1)
+        current_ids = torch.tensor([[5, 6, 7]]).expand(batch, -1)
+        kwargs = dict(
+            conditioning_previous_ids=previous_ids,
+            conditioning_current_ids=current_ids,
+            precomputed_base_logits=model.lm_head(hidden),
+        )
+        model.config.correction_markov_projection_fusion = False
+        model.config.selector_correction_feedback = "static"
+        expected = model._rollout_correction_steps(hidden, anchors, **kwargs)
+        model.config.correction_markov_projection_fusion = True
+        original_head_calls = []
+        handles = [
+            head.register_forward_hook(
+                lambda *args, calls=original_head_calls: calls.append(True)
+            )
+            for head in (
+                model.correction_head.correction_up,
+                model.markov_head.markov_w2,
+            )
+        ]
+        try:
+            actual = model._rollout_correction_steps(hidden, anchors, **kwargs)
+        finally:
+            for handle in handles:
+                handle.remove()
+        assert not original_head_calls
+        tolerance = 0.025 if dtype == torch.bfloat16 else 2e-5
+        for name in ("logits", "causal_states", "corrected_hidden"):
+            torch.testing.assert_close(
+                getattr(actual, name),
+                getattr(expected, name),
+                atol=tolerance,
+                rtol=tolerance,
+            )
+        torch.testing.assert_close(actual.token_ids, expected.token_ids)
+        # Exercise the actual online Selector/Feedback entry point as well.
+        model.config.selector_correction_feedback = "corrected"
+        model.config.correction_markov_projection_fusion = False
+        expected_tokens, expected_logits = model.rollout_correction(hidden, anchors)
+        model.config.correction_markov_projection_fusion = True
+        tokens, logits = model.rollout_correction(hidden, anchors)
+        torch.testing.assert_close(
+            logits, expected_logits, atol=tolerance, rtol=tolerance
+        )
+        torch.testing.assert_close(tokens, expected_tokens)
+        cached = model._joint_projection_weight
+        model.rollout_correction(hidden, anchors)
+        assert model._joint_projection_weight is cached
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"correction_output_mode": "hidden"},
+        {"correction_with_markov": False},
+        {"markov_head_type": "gated"},
+        {"correction_project_corrected_hidden": True},
+    ],
+)
+def test_joint_projection_rejects_incompatible_heads(override, monkeypatch):
+    model = runtime("cpu", False, monkeypatch, joint_projection=True)
+    values = model.config.model_dump()
+    values.update(override)
+    with pytest.raises(ValueError):
+        type(model.config).from_checkpoint(values)
