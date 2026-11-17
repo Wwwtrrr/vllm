@@ -631,6 +631,8 @@ class SpeculativeConfig:
     """Override retrieval width for a trained LEAGLE candidate head."""
     leagle_candidate_rerank: bool | None = None
     """True rescores candidates; false uses low-rank full-vocabulary logits."""
+    leagle_target_input_graphs: bool = True
+    """On Ascend FULL decode, capture target token, position and KV-map preparation."""
     leagle_lm_head_quantization: Literal["w8a8"] | None = None
     """Ascend INT8 full head, or the enabled candidate vocabulary up-projection."""
     leagle_release_quantized_source: bool = False
@@ -669,6 +671,7 @@ class SpeculativeConfig:
                     self.leagle_use_candidate_head,
                     self.leagle_candidate_top_k,
                     self.leagle_candidate_rerank,
+                    self.leagle_target_input_graphs,
                     self.leagle_lm_head_quantization,
                     self.leagle_release_quantized_source,
                 )

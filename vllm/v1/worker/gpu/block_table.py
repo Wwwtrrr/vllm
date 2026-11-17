@@ -161,6 +161,7 @@ class BlockTables:
         num_reqs_padded: int,
         out: tuple[torch.Tensor, ...] | None = None,
         out_ptrs: torch.Tensor | None = None,
+        num_blocks: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         if self.num_kv_cache_groups == 0:
             return ()
@@ -171,14 +172,16 @@ class BlockTables:
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
         num_reqs = idx_mapping.shape[0]
+        if num_blocks is None:
+            num_blocks = self.num_blocks.gpu
         # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
             idx_mapping,
             self.block_table_ptrs,
             out_ptrs,
             self.block_table_strides,
-            self.num_blocks.gpu,
-            self.num_blocks.gpu.stride(0),
+            num_blocks,
+            num_blocks.stride(0),
             num_reqs,
             BLOCK_SIZE=1024,  # type: ignore
         )

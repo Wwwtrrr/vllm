@@ -302,3 +302,12 @@ also be run on the deployment machine with the actual trained checkpoint.
 
 Inference-time decomposition has been removed. Delete the obsolete
 `leagle_candidate_svd_rank` option from existing launch configurations.
+
+On Ascend ModelRunner V2, `leagle_target_input_graphs` defaults to `true` and
+restores startup capture of FULL decode verification-input and KV-map
+preparation. It requires one KV group and compatible decode-only inputs;
+prefill, PCP and adaptive verification use the existing path. Set this option
+to `false` in `speculative_config` and restart for an A/B comparison. Capture
+time and graph memory grow with `max_num_seqs`. This option does not change
+candidate rank or W8A8 and has no effect on CUDA. Validate native ACL replay and
+performance on the deployment hardware.
