@@ -634,11 +634,7 @@ class SpeculativeConfig:
     leagle_target_input_graphs: bool = True
     """On Ascend FULL decode, capture target token, position and KV-map preparation."""
     leagle_merge_target_input_graph: bool = False
-    """Experimental Ascend batched decode input prefix inside target FULL.
-
-    Supports compatible standard attention layouts, including TP/DP. Unsupported
-    model states and padding layouts fall back to separate input preparation.
-    """
+    """Experimental Ascend BS1/TP1 Qwen3 decode input prefix inside target FULL."""
     leagle_lm_head_quantization: Literal["w8a8"] | None = None
     """Ascend INT8 full head, or the enabled candidate vocabulary up-projection."""
     leagle_release_quantized_source: bool = False
