@@ -311,3 +311,11 @@ to `false` in `speculative_config` and restart for an A/B comparison. Capture
 time and graph memory grow with `max_num_seqs`. This option does not change
 candidate rank or W8A8 and has no effect on CUDA. Validate native ACL replay and
 performance on the deployment hardware.
+
+`leagle_merge_target_input_graph=False` is an experimental Ascend-only opt-in.
+When enabled alongside `leagle_target_input_graphs`, compatible Qwen3 FULL decode
+steps capture input preparation and target forward in one graph. The initial
+path requires `max_num_seqs=1`, TP/PP/DP/PCP/DCP=1, one KV group and no token
+padding; other steps use the existing preparation path. It does not remove CPU
+attention metadata updates or sequence-length synchronization. Validate native
+NPU output parity and latency before use; this option has no CUDA effect.
