@@ -659,6 +659,10 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
 
+    def _prepare_fullgraph_inputs(self, desc: BatchExecutionDescriptor) -> None:
+        """Run device input preparation inside FULL graph warmup and capture."""
+        pass
+
     def capture(
         self,
         model: nn.Module,
@@ -836,6 +840,8 @@ class ModelCudaGraphManager(CudaGraphManager):
                         # run_pw_graph).
                         model_output = self.run_pw_graph(model, model_inputs)
                     else:
+                        if desc.cg_mode == CUDAGraphMode.FULL:
+                            self._prepare_fullgraph_inputs(desc)
                         model_output = model(**model_inputs)
 
                 if cg_mode == CUDAGraphMode.PIECEWISE:
