@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Callable
 from functools import cache
 from typing import TYPE_CHECKING, NamedTuple, cast, get_args
 
@@ -190,7 +191,17 @@ def get_attn_backend(
 
     # The KV cache layout is resolved across all of the model's backends at once
     # in get_kv_cache_spec(); a single selection cannot see its peers.
-    return _cached_get_attn_backend(
+    from vllm.platforms import current_platform
+
+    select_backend: Callable[..., type[AttentionBackend]] = _cached_get_attn_backend
+    is_cacheable = getattr(
+        current_platform, "is_attention_backend_selection_cacheable", None
+    )
+    if is_cacheable is not None and not is_cacheable(vllm_config):
+        # A platform may select by configurations or model roles that are not
+        # part of the layer-level cache key.
+        select_backend = _cached_get_attn_backend.__wrapped__
+    return select_backend(
         backend=backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
