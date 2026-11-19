@@ -56,7 +56,7 @@ class SpeculatorsConfig(PreTrainedConfig):
             )
 
         # Start with transformer layer configuration if present
-        pre_trained_config = config_dict.get("transformer_layer_config", {})
+        pre_trained_config = dict(config_dict.get("transformer_layer_config", {}))
         # Apply anything specific to the supported algorithm
         algo_updater = SUPPORTED_SPECULATORS_TYPES[speculators_model_type]
         algo_updater(config_dict=config_dict, pre_trained_config=pre_trained_config)

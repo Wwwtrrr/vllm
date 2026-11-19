@@ -401,6 +401,13 @@ class Platform:
         return ""
 
     @classmethod
+    def is_attention_backend_selection_cacheable(
+        cls, vllm_config: "VllmConfig"
+    ) -> bool:
+        """Whether the layer-level key captures this platform's selection inputs."""
+        return True
+
+    @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
         return [
             AttentionBackendEnum.TORCH_SDPA,

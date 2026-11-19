@@ -826,6 +826,10 @@ class VllmConfig:
     @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        if self.speculative_config and self.speculative_config.method == "leagle":
+            if use_v2_model_runner is False:
+                raise ValueError("LEAGLE requires VLLM_USE_V2_MODEL_RUNNER=1")
+            return True
         if use_v2_model_runner is not None:
             return use_v2_model_runner
 

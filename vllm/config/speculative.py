@@ -80,7 +80,12 @@ NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "leagle",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -108,6 +113,7 @@ _METHOD_SPECIFIC_OPTIONS = (
     "index_share_for_mtp_iteration",
     "xpress_topc",
     "speculator_options",
+    "leagle_lm_head_quantization",
 )
 
 # RoPE types for which get_rope uses max_position_embeddings only to size the
@@ -722,6 +728,27 @@ class SpeculativeConfig:
 
     fly_entropy_top_k: int = Field(default=3, ge=1)
     """Number of largest target probabilities used by FLy's entropy gate."""
+
+    leagle_reuse_context_kv: bool = True
+    """Reuse target-conditioned LEAGLE prefix KV across proposal rounds."""
+    leagle_static_draft_kv: bool = True
+    """Use fixed inference buffers instead of repeatedly concatenating draft KV."""
+    leagle_batch_drafts: bool = True
+    """Batch LEAGLE requests, including padded FULL graph replay."""
+    leagle_fused_projections: bool = True
+    """Pack QKV/KV and gate/up projections without changing checkpoint names."""
+    leagle_fused_rmsnorm: bool = True
+    """Use the serving device's fused RMSNorm for LEAGLE."""
+    leagle_use_candidate_head: bool | None = None
+    """Use checkpoint candidate-head setting by default; false selects dense A/B."""
+    leagle_candidate_top_k: int | None = Field(default=None, ge=1)
+    """Override retrieval width for a trained LEAGLE candidate head."""
+    leagle_candidate_rerank: bool | None = None
+    """True rescores candidates; false uses low-rank full-vocabulary logits."""
+    leagle_lm_head_quantization: Literal["w8a8"] | None = None
+    """Ascend INT8 full head, or the enabled candidate vocabulary up-projection."""
+    leagle_release_quantized_source: bool = False
+    """Release unused BF16 projection weights after W8A8 installation."""
 
     def compute_hash(self) -> str:
         """WARNING: Whenever a new field is added to this config,
@@ -1374,6 +1401,9 @@ class SpeculativeConfig:
         elif self.method == "[ngram]":
             self.method = "ngram"
 
+        if self.method == "leagle" and self.model is None:
+            raise ValueError("method='leagle' requires a LEAGLE checkpoint model")
+
         config_cls = get_method_config_class(self)
         # DSpark drafts carry their own width (block size), so the default
         # draft is resolved even without num_speculative_tokens.
@@ -1395,6 +1425,11 @@ class SpeculativeConfig:
                     f"{self.custom_method or self.method!r}."
                 )
         config_cls.apply_options(self)
+
+        if self.leagle_release_quantized_source and (
+            self.method != "leagle" or self.leagle_lm_head_quantization != "w8a8"
+        ):
+            raise ValueError("leagle_release_quantized_source requires LEAGLE W8A8")
 
         if (
             config_cls.adaptive_verification_uses_draft_logits
@@ -1773,7 +1808,7 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        return self.method in ("eagle", "eagle3", "leagle", "mtp", "dflash", "dspark")
 
     def needs_eagle_block_drop(self) -> bool:
         """Whether draft KV at a position depends on the next token.

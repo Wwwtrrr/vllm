@@ -294,6 +294,7 @@ _CONFIG_BY_METHOD: dict[str, str] = {
     "suffix": _builtin("suffix.config", "SuffixSpeculatorConfig"),
     "eagle": _builtin("eagle.config", "EagleSpeculatorConfig"),
     "eagle3": _builtin("eagle.config", "Eagle3SpeculatorConfig"),
+    "leagle": _builtin("leagle.config", "LEagleSpeculatorConfig"),
     "mtp": _builtin("mtp.config", "MTPSpeculatorConfig"),
     "dflash": _builtin("dflash.config", "DFlashSpeculatorConfig"),
     "dspark": _builtin("dspark.config", "DSparkSpeculatorConfig"),
